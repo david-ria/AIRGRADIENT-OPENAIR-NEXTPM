@@ -54,8 +54,9 @@ Where `<serial>` = STA MAC in lowercase without “:”.
   "pm003Count": 157,
   "rco2": 742
 }
-Fields are included only when valid.
 ```
+Fields are included only when valid.
+
 
 🚀 How to Use
 Clone this repository:
