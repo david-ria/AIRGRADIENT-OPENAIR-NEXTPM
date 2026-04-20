@@ -28,6 +28,9 @@
 #include <math.h>
 #include <string.h>
 
+// Forward decl so the Arduino .ino auto-prototypes see the type name
+struct NextPMSample;
+
 // -------------------- Pins / UART --------------------
 constexpr int NEXTPM_RX_PIN = 0;
 constexpr int NEXTPM_TX_PIN = 1;
@@ -63,6 +66,18 @@ static VOCGasIndexAlgorithm vocAlgo;
 static NOxGasIndexAlgorithm noxAlgo;
 static uint32_t sgpBootMs = 0;
 static bool i2cInitialized = false;
+static SemaphoreHandle_t i2cMutex = nullptr;
+
+// Rolling window for gas-index smoothing (POST stability)
+static constexpr int GAS_WIN = 10;  // 10 samples @ 1 Hz = 10 s
+static int32_t vocHist[GAS_WIN] = {0};
+static int32_t noxHist[GAS_WIN] = {0};
+static int     gasHistIdx = 0;
+static int     gasHistCount = 0;
+static uint32_t gasMissedTicks = 0;   // diagnostic: how many 1 Hz ticks we were late (should stay 0)
+
+static inline void i2cLock()   { if (i2cMutex) xSemaphoreTake(i2cMutex, portMAX_DELAY); }
+static inline void i2cUnlock() { if (i2cMutex) xSemaphoreGive(i2cMutex); }
 
 // ==================== Shared latest data ==============
 struct NextPMSample {
@@ -97,9 +112,11 @@ struct LatestData {
   bool shtOk = false, shtPresent = false;
   // Gas indexes (SGP41 + Sensirion gas index algorithm)
   int32_t vocIndex = 0, noxIndex = 0;
+  int32_t vocIndexAvg = 0, noxIndexAvg = 0;  // rolling 10 s avg used in POST
   uint16_t sgpSrawVoc = 0, sgpSrawNox = 0;
   bool sgpOk = false, sgpPresent = false;
   bool sgpConditioning = true;
+  uint32_t gasSamples = 0;  // diagnostic: total 1 Hz ticks taken
   // Cloud POST
   int lastPostCode = 0;
   String lastPostResp;
@@ -398,8 +415,9 @@ static bool postToAirGradient(float pm01, float pm02, float pm10,
     payload += String(",\"rhum\":") + String(latest.rhum, 2);
   }
   if (latest.sgpOk && !latest.sgpConditioning) {
-    payload += String(",\"tvoc_index\":") + String(latest.vocIndex);
-    payload += String(",\"nox_index\":")  + String(latest.noxIndex);
+    // Use the 10 s rolling average to prevent sawtooth on the cloud graph
+    payload += String(",\"tvoc_index\":") + String(latest.vocIndexAvg);
+    payload += String(",\"nox_index\":")  + String(latest.noxIndexAvg);
     payload += String(",\"tvoc_raw\":")   + String(latest.sgpSrawVoc);
     payload += String(",\"nox_raw\":")    + String(latest.sgpSrawNox);
   }
@@ -428,44 +446,84 @@ h1{margin:0 0 12px;font-size:18px}.row{display:grid;grid-template-columns:repeat
 .v{font-size:26px;font-weight:600;line-height:1.1}.ok{color:#4caf50}.err{color:#f44336}.warn{color:#ffa000}
 .box{background:#1e1e1e;border-radius:8px;padding:10px 12px;margin:8px 0}
 pre{background:#000;color:#9cf;padding:8px;border-radius:4px;overflow-x:auto;font-size:11px;margin:4px 0;white-space:pre-wrap;word-break:break-all}
-.meta{color:#777;font-size:11px}a{color:#7af}</style></head>
+.meta{color:#777;font-size:11px}a{color:#7af}
+.tabs{display:inline-flex;gap:4px;background:#222;border-radius:8px;padding:4px;margin:0 0 8px}
+.tab{padding:6px 12px;border-radius:6px;cursor:pointer;user-select:none;font-size:13px;color:#aaa}
+.tab.active{background:#2a5a2a;color:#cfc;font-weight:600}
+.tab .star{color:#ffa000;margin-left:4px}</style></head>
 <body><h1>OpenAir NextPM — Local Dashboard</h1>
 <div id="root">Loading…</div>
-<div class="meta">Auto-refresh 2s · <a href="/json">/json</a> · <a href="/probe">/probe</a> (Modbus scan) · <a href="/s8scan">/s8scan</a> (S8 RX-pin sweep)</div>
+<div class="meta">Auto-refresh 2s · <a href="/json">/json</a> · <a href="/probe">/probe</a> · <a href="/s8scan">/s8scan</a> · <a href="/i2cscan">/i2cscan</a></div>
 <script>
 function esc(s){return (s==null?'':''+s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function card(name,val,unit,ok){return '<div class="card"><div class="u">'+name+'</div><div class="v '+(ok===true?'ok':ok===false?'err':'')+'">'+val+'</div><div class="u">'+unit+'</div></div>';}
+
+// Local display preference (independent from postAvgSec which drives the cloud POST)
+let viewPeriod = parseInt(localStorage.getItem('viewPeriod')||'60');
+if (![10,60,900].includes(viewPeriod)) viewPeriod = 60;
+let cachedPostAvg = 60;
+
+async function setPrimary(sec) {
+  // Switch both the local view AND the cloud primary (so AirGradient matches).
+  viewPeriod = sec;
+  localStorage.setItem('viewPeriod', String(sec));
+  try { await fetch('/setperiod?sec='+sec, {cache:'no-store'}); } catch(e){}
+  refresh();
+}
+async function setViewOnly(sec) {
+  viewPeriod = sec;
+  localStorage.setItem('viewPeriod', String(sec));
+  refresh();
+}
+
+function pickSample(d, sec) {
+  if (sec==10)  return {pm1:d.pm_10s_pm1, pm25:d.pm_10s_pm25, pm10:d.pm_10s_pm10, cnt:d.pm_10s_cntPM1_dL, ok:d.pm_10s_ok, state:d.pm_10s_state};
+  if (sec==900) return {pm1:d.pm_15m_pm1, pm25:d.pm_15m_pm25, pm10:d.pm_15m_pm10, cnt:d.pm_15m_cntPM1_dL, ok:d.pm_15m_ok, state:d.pm_15m_state};
+  return           {pm1:d.pm_60s_pm1, pm25:d.pm_60s_pm25, pm10:d.pm_60s_pm10, cnt:d.pm_60s_cntPM1_dL, ok:d.pm_60s_ok, state:d.pm_60s_state};
+}
+
 async function refresh(){
  try {
   const r = await fetch('/json',{cache:'no-store'}); const d = await r.json();
-  let h = '<div class="row">';
-  h += card('PM1',  d.pm1 ==null?'—':d.pm1.toFixed(1),  'µg/m³', d.massOk);
-  h += card('PM2.5',d.pm25==null?'—':d.pm25.toFixed(1), 'µg/m³', d.massOk);
-  h += card('PM10', d.pm10==null?'—':d.pm10.toFixed(1), 'µg/m³', d.massOk);
-  h += card('PM0.3≈', d.pm003_dL>=0?d.pm003_dL:'—',     '/dL',   d.binsOk);
-  h += card('CO₂',   d.co2Ok?d.co2:'—',                 'ppm',   d.co2Ok);
+  cachedPostAvg = d.postAvgSec;
+  const sel = pickSample(d, viewPeriod);
+
+  // Period tabs (click = switch view + cloud primary; shift-click = view only)
+  const mkTab = (sec, lbl) => {
+    const active = viewPeriod===sec ? ' active':'';
+    const star   = cachedPostAvg===sec ? '<span class="star" title="Also the period sent to AirGradient">★</span>' : '';
+    return '<span class="tab'+active+'" onclick="event.shiftKey?setViewOnly('+sec+'):setPrimary('+sec+')">'+lbl+star+'</span>';
+  };
+  let h = '<div class="tabs">' + mkTab(10,'10 s') + mkTab(60,'60 s') + mkTab(900,'15 min') + '</div>';
+  h += '<div class="meta" style="margin-bottom:8px">★ = période envoyée au cloud · click = switch local + cloud · shift+click = switch local seulement</div>';
+
+  h += '<div class="row">';
+  h += card('PM1',   sel.pm1 ==null?'—':sel.pm1.toFixed(1),  'µg/m³', sel.ok);
+  h += card('PM2.5', sel.pm25==null?'—':sel.pm25.toFixed(1), 'µg/m³', sel.ok);
+  h += card('PM10',  sel.pm10==null?'—':sel.pm10.toFixed(1), 'µg/m³', sel.ok);
+  h += card('PM0.3≈',sel.ok?sel.cnt:'—',                     '/dL',   sel.ok);
+  h += card('CO₂',   d.co2Ok?d.co2:'—',                      'ppm',   d.co2Ok);
   h += card('Temp',  d.shtOk && d.atmp!=null?d.atmp.toFixed(1):'—','°C',    d.shtOk);
   h += card('RH',    d.shtOk && d.rhum!=null?d.rhum.toFixed(0):'—','%',     d.shtOk);
-  h += card('TVOC',  d.sgpOk && !d.sgpConditioning?d.tvoc_index:'—','index',d.sgpOk && !d.sgpConditioning);
-  h += card('NOx',   d.sgpOk && !d.sgpConditioning?d.nox_index:'—','index', d.sgpOk && !d.sgpConditioning);
-  h += card('RSSI',  d.rssi,                            'dBm',   true);
+  h += card('TVOC',  d.sgpOk && !d.sgpConditioning?d.tvoc_index_avg:'—','index 10s',d.sgpOk && !d.sgpConditioning);
+  h += card('NOx',   d.sgpOk && !d.sgpConditioning?d.nox_index_avg :'—','index 10s', d.sgpOk && !d.sgpConditioning);
+  h += card('RSSI',  d.rssi,                                 'dBm',   true);
   h += '</div>';
-  const per = d.postAvgSec;
-  const perLabel = per==10?'10 s':per==900?'15 min':'60 s';
+
   const fmt = s => s==null?'—':s.toFixed(1);
-  const row = (lbl,s,isSel)=> '<tr'+(isSel?' style="background:#1b3a1b;color:#cfc"':'')
-    +'><td>'+lbl+(isSel?' ★':'')+'</td><td>'+fmt(s.pm1)+'</td><td>'+fmt(s.pm25)+'</td><td>'+fmt(s.pm10)
+  const row = (lbl,s,sec)=> '<tr'+(viewPeriod==sec?' style="background:#1b3a1b;color:#cfc"':'')
+    +'><td>'+lbl+(cachedPostAvg==sec?' ★':'')+'</td><td>'+fmt(s.pm1)+'</td><td>'+fmt(s.pm25)+'</td><td>'+fmt(s.pm10)
     +'</td><td>'+s.cntPM1_dL+'</td><td>'+(s.ok?'<span class=ok>ok</span>':'<span class=err>fail</span>')+'</td></tr>';
-  h += '<div class="box"><b>NextPM</b> — période primaire : <b>'+perLabel+'</b>'
-     + '  <small>(<a href="/setperiod?sec=10">10s</a> · <a href="/setperiod?sec=60">60s</a> · <a href="/setperiod?sec=900">15m</a>)</small>'
+  h += '<div class="box"><b>NextPM</b> — vue actuelle : <b>'+(viewPeriod==10?'10 s':viewPeriod==900?'15 min':'60 s')+'</b>'
+     + ' · cloud : <b>'+(cachedPostAvg==10?'10 s':cachedPostAvg==900?'15 min':'60 s')+'</b>'
      + '<table style="width:100%;margin-top:6px;font-size:12px;border-collapse:collapse"><thead><tr style="color:#888">'
      + '<th style="text-align:left">Moyennage</th><th>PM1</th><th>PM2.5</th><th>PM10</th><th>cnt≥0.3µm /dL</th><th>ok</th></tr></thead><tbody>'
-     + row('10 s',  d.pm_10s_pm1!=null?{pm1:d.pm_10s_pm1,pm25:d.pm_10s_pm25,pm10:d.pm_10s_pm10,cntPM1_dL:d.pm_10s_cntPM1_dL,ok:d.pm_10s_ok}:{pm1:null,pm25:null,pm10:null,cntPM1_dL:0,ok:false}, per==10)
-     + row('60 s',  {pm1:d.pm_60s_pm1,pm25:d.pm_60s_pm25,pm10:d.pm_60s_pm10,cntPM1_dL:d.pm_60s_cntPM1_dL,ok:d.pm_60s_ok}, per==60)
-     + row('15 min',{pm1:d.pm_15m_pm1,pm25:d.pm_15m_pm25,pm10:d.pm_15m_pm10,cntPM1_dL:d.pm_15m_cntPM1_dL,ok:d.pm_15m_ok}, per==900)
+     + row('10 s',  {pm1:d.pm_10s_pm1,pm25:d.pm_10s_pm25,pm10:d.pm_10s_pm10,cntPM1_dL:d.pm_10s_cntPM1_dL,ok:d.pm_10s_ok}, 10)
+     + row('60 s',  {pm1:d.pm_60s_pm1,pm25:d.pm_60s_pm25,pm10:d.pm_60s_pm10,cntPM1_dL:d.pm_60s_cntPM1_dL,ok:d.pm_60s_ok}, 60)
+     + row('15 min',{pm1:d.pm_15m_pm1,pm25:d.pm_15m_pm25,pm10:d.pm_15m_pm10,cntPM1_dL:d.pm_15m_cntPM1_dL,ok:d.pm_15m_ok}, 900)
      + '</tbody></table>'
      + '<div class="u" style="margin-top:4px">state=0x'+d.nextpmState.toString(16).padStart(2,'0')
-     + ' · modbus-bins '+(d.binsOk?'<span class=ok>OK</span>':'<span class=err>FAIL</span>')
+     + ' · gas samples=' + d.gas_samples + ' · missed ticks=' + d.gas_missed
      + '</div></div>';
   h += '<div class="box"><b>S8 CO₂:</b> '+(d.co2Ok?'<span class=ok>OK '+d.co2+' ppm</span>':'<span class=err>read failed</span>')+'</div>';
   h += '<div class="box"><b>Last cloud POST:</b> HTTP '+d.lastPostCode+' <span class="meta">'+esc(d.lastPostResp)+'</span></div>';
@@ -521,8 +579,12 @@ static void handleJson() {
   j += ",\"rhum\":"    + floatOrNull(latest.rhum, 2);
   j += ",\"shtOk\":"   + String(latest.shtOk ? "true" : "false");
   j += ",\"shtPresent\":" + String(latest.shtPresent ? "true" : "false");
-  j += ",\"tvoc_index\":" + String(latest.vocIndex);
-  j += ",\"nox_index\":"  + String(latest.noxIndex);
+  j += ",\"tvoc_index\":"     + String(latest.vocIndex);
+  j += ",\"nox_index\":"      + String(latest.noxIndex);
+  j += ",\"tvoc_index_avg\":" + String(latest.vocIndexAvg);
+  j += ",\"nox_index_avg\":"  + String(latest.noxIndexAvg);
+  j += ",\"gas_samples\":"    + String(latest.gasSamples);
+  j += ",\"gas_missed\":"     + String(gasMissedTicks);
   j += ",\"tvoc_raw\":"   + String(latest.sgpSrawVoc);
   j += ",\"nox_raw\":"    + String(latest.sgpSrawNox);
   j += ",\"sgpOk\":"      + String(latest.sgpOk ? "true" : "false");
@@ -632,6 +694,7 @@ static void initI2CSensors() {
     Serial.println("[I2C] Wire.begin failed");
     return;
   }
+  if (!i2cMutex) i2cMutex = xSemaphoreCreateMutex();
   i2cInitialized = true;
 
   // Probe SHT4x at 0x44
@@ -665,7 +728,7 @@ static void initI2CSensors() {
   }
 }
 
-// Read SHT4x, update latest.atmp/rhum. Returns true on success.
+// Read SHT4x (I2C mutex held by caller)
 static bool sampleSHT() {
   if (!latest.shtPresent) return false;
   float t = NAN, rh = NAN;
@@ -677,13 +740,14 @@ static bool sampleSHT() {
   return true;
 }
 
-// Sample SGP41. During first SGP41_COND_MS use executeConditioning, then measureRawSignals.
+// Sample SGP41 at 1 Hz (I2C mutex held by caller). During first SGP41_COND_MS
+// use executeConditioning, then measureRawSignals.
 static bool sampleSGP() {
   if (!latest.sgpPresent) return false;
 
   // Compensation words: default 25 °C / 50 % RH if no SHT
-  uint16_t compRh = 0x8000; // 50 %
-  uint16_t compT  = 0x6666; // 25 °C
+  uint16_t compRh = 0x8000;
+  uint16_t compT  = 0x6666;
   if (latest.shtOk && !isnan(latest.atmp) && !isnan(latest.rhum)) {
     float rh = constrain(latest.rhum, 0.0f, 100.0f);
     float t  = constrain(latest.atmp, -45.0f, 130.0f);
@@ -707,13 +771,47 @@ static bool sampleSGP() {
   latest.sgpSrawVoc = srawVoc;
   latest.sgpSrawNox = srawNox;
   latest.sgpOk = true;
+  latest.gasSamples++;
 
-  // Feed gas index algorithm (must be called at ~1 Hz steady cadence)
   int32_t voc = vocAlgo.process((int32_t)srawVoc);
   int32_t nox = conditioning ? 0 : noxAlgo.process((int32_t)srawNox);
   latest.vocIndex = voc;
   latest.noxIndex = nox;
+
+  // Rolling 10 s average (suppresses display sawtooth)
+  vocHist[gasHistIdx] = voc;
+  noxHist[gasHistIdx] = nox;
+  gasHistIdx = (gasHistIdx + 1) % GAS_WIN;
+  if (gasHistCount < GAS_WIN) gasHistCount++;
+  int64_t vs = 0, ns = 0;
+  for (int i = 0; i < gasHistCount; i++) { vs += vocHist[i]; ns += noxHist[i]; }
+  latest.vocIndexAvg = (int32_t)(vs / gasHistCount);
+  latest.noxIndexAvg = (int32_t)(ns / gasHistCount);
   return true;
+}
+
+// Dedicated 1 Hz FreeRTOS task so I/O-heavy activities in loop() never
+// stretch the gas-index algorithm cadence (which is what makes TVOC/NOx
+// look like a sawtooth).
+static void gasSensorTask(void*) {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(GAS_SAMPLE_MS);
+  for (;;) {
+    if (i2cInitialized) {
+      i2cLock();
+      sampleSHT();
+      sampleSGP();
+      i2cUnlock();
+    }
+    // Count a "miss" only when we're more than half a tick behind schedule —
+    // i.e. the sampling couldn't keep up with the 1 Hz cadence.
+    TickType_t now = xTaskGetTickCount();
+    TickType_t scheduled = lastWake + period;
+    if ((int32_t)(now - scheduled) > (int32_t)(period / 2)) {
+      gasMissedTicks++;
+    }
+    vTaskDelayUntil(&lastWake, period);
+  }
 }
 
 // ==================== I2C bus scan ====================
@@ -749,13 +847,14 @@ static void handleI2CScan() {
 
   String out = "I2C bus scan\n============\n";
 
+  // Block the gas task while we mess with the bus pins.
+  i2cLock();
   for (int p = 0; p < N; p++) {
     int sda = pairs[p][0], scl = pairs[p][1];
     out += "\n[SDA=GPIO" + String(sda) + " SCL=GPIO" + String(scl) + "]\n";
 
     Wire.end();
     delay(10);
-    // Some boards need a small pre-toggle to release any stuck slave.
     if (!Wire.begin(sda, scl, 100000)) {
       out += "  Wire.begin failed\n";
       continue;
@@ -776,7 +875,11 @@ static void handleI2CScan() {
     if (found == 0) out += "  (no devices)\n";
   }
 
+  // Restore normal I2C config for the gas task
   Wire.end();
+  delay(10);
+  Wire.begin(I2C_SDA, I2C_SCL, 100000);
+  i2cUnlock();
   webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(200, "text/plain", out);
 }
@@ -881,6 +984,9 @@ void setup() {
   Serial.printf("I2C  : SDA=%d SCL=%d\n", I2C_SDA, I2C_SCL);
 
   initI2CSensors();
+  if (i2cInitialized) {
+    xTaskCreatePinnedToCore(gasSensorTask, "gas", 4096, nullptr, 2, nullptr, tskNO_AFFINITY);
+  }
 
   ensureWifiConnected();
 
@@ -913,12 +1019,8 @@ void loop() {
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
   }
 
-  // Gas sensors at 1 Hz (required for Sensirion gas index algorithm)
-  if (i2cInitialized && millis() - tLastGas >= GAS_SAMPLE_MS) {
-    tLastGas = millis();
-    sampleSHT();
-    sampleSGP();
-  }
+  // Gas sampling lives in its own FreeRTOS task (see gasSensorTask).
+  (void)tLastGas;
 
   if (millis() - tLastPost > POST_PERIOD_MS) {
     tLastPost = millis();
