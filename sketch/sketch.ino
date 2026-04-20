@@ -65,13 +65,26 @@ static uint32_t sgpBootMs = 0;
 static bool i2cInitialized = false;
 
 // ==================== Shared latest data ==============
+struct NextPMSample {
+  float pm1 = NAN, pm25 = NAN, pm10 = NAN;
+  uint16_t cntPM1_dL = 0, cntPM25_dL = 0, cntPM10_dL = 0;
+  uint8_t state = 0xFF;
+  bool ok = false;
+  String rawHex;
+};
+
 struct LatestData {
-  // Mass
+  // Selected period mirror (for backward-compat + AirGradient POST)
   float pm1 = NAN, pm25 = NAN, pm10 = NAN;
   uint8_t nextpmState = 0xFF;
   bool massOk = false;
-  // Cumulative counts from simple protocol (cnt/dL, cut at each PM size)
+  // Cumulative counts from simple protocol (cnt/dL, cut at each PM size) — from selected period
   uint16_t cntPM1_dL = 0, cntPM25_dL = 0, cntPM10_dL = 0;
+  // All three NextPM averaging periods
+  NextPMSample avg10s;   // cmd 0x11
+  NextPMSample avg60s;   // cmd 0x12
+  NextPMSample avg15m;   // cmd 0x13
+  uint16_t postAvgSec = 60; // which period is the "primary" pushed to AG and mirrored above
   // Bins (Cnt/L) — Modbus (optional / placeholder for when we find the right regs)
   float c02_05 = 0, c05_10 = 0, c10_25 = 0, c25_50 = 0, c50_100 = 0;
   int pm003_dL = -1;
@@ -194,8 +207,8 @@ static bool nextpmSendSimpleCmd(uint8_t cmd) {
 }
 
 // ==================== NextPM: Simple protocol =========
-// Reads 1-min averages (cmd 0x12). Response format (16 bytes):
-//   [0]=0x81 [1]=0x12 [2]=state
+// Simple-protocol mass commands. Response format (16 bytes) is identical across periods:
+//   [0]=0x81 [1]=cmd [2]=state
 //   [3..4]  cumul. count PM1  cut (>=~0.3 µm) in cnt/(0.1L) = cnt/dL
 //   [5..6]  cumul. count PM2.5 cut
 //   [7..8]  cumul. count PM10 cut
@@ -203,13 +216,11 @@ static bool nextpmSendSimpleCmd(uint8_t cmd) {
 //   [11..12] mass PM2.5
 //   [13..14] mass PM10
 //   [15] checksum (sum % 256 == 0)
-static bool nextpmReadMass(float& pm1ug, float& pm25ug, float& pm10ug,
-                           uint16_t& cntPM1_dL, uint16_t& cntPM25_dL, uint16_t& cntPM10_dL,
-                           uint8_t* outState, String& rawHex) {
-  pm1ug = pm25ug = pm10ug = NAN;
-  cntPM1_dL = cntPM25_dL = cntPM10_dL = 0;
+// cmd=0x11 -> 10 s avg, cmd=0x12 -> 60 s avg, cmd=0x13 -> 15 min avg
+static bool nextpmReadMassCmd(uint8_t cmd, NextPMSample& s) {
+  s = NextPMSample{};
   while (NextPMSerial.available()) NextPMSerial.read();
-  if (!nextpmSendSimpleCmd(0x12)) { rawHex = "(send fail)"; return false; }
+  if (!nextpmSendSimpleCmd(cmd)) { s.rawHex = "(send fail)"; return false; }
 
   const uint32_t t0 = millis();
   const uint32_t timeoutMs = 500;
@@ -217,19 +228,20 @@ static bool nextpmReadMass(float& pm1ug, float& pm25ug, float& pm10ug,
   while (got < sizeof(buf) && millis() - t0 < timeoutMs) {
     if (NextPMSerial.available()) buf[got++] = (uint8_t)NextPMSerial.read();
   }
-  rawHex = bytesToHex(buf, got);
+  s.rawHex = bytesToHex(buf, got);
   if (got != sizeof(buf)) return false;
-  if (buf[0] != 0x81 || buf[1] != 0x12) return false;
+  if (buf[0] != 0x81 || buf[1] != cmd) return false;
   if (nextpmChecksum(buf, 15) != buf[15]) return false;
 
-  if (outState) *outState = buf[2];
+  s.state = buf[2];
   auto U16 = [](const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); };
-  cntPM1_dL  = U16(&buf[3]);
-  cntPM25_dL = U16(&buf[5]);
-  cntPM10_dL = U16(&buf[7]);
-  pm1ug  = U16(&buf[9])  / 10.0f;
-  pm25ug = U16(&buf[11]) / 10.0f;
-  pm10ug = U16(&buf[13]) / 10.0f;
+  s.cntPM1_dL  = U16(&buf[3]);
+  s.cntPM25_dL = U16(&buf[5]);
+  s.cntPM10_dL = U16(&buf[7]);
+  s.pm1  = U16(&buf[9])  / 10.0f;
+  s.pm25 = U16(&buf[11]) / 10.0f;
+  s.pm10 = U16(&buf[13]) / 10.0f;
+  s.ok = true;
   return true;
 }
 
@@ -438,12 +450,23 @@ async function refresh(){
   h += card('NOx',   d.sgpOk && !d.sgpConditioning?d.nox_index:'—','index', d.sgpOk && !d.sgpConditioning);
   h += card('RSSI',  d.rssi,                            'dBm',   true);
   h += '</div>';
-  h += '<div class="box"><b>NextPM:</b> state=0x'+d.nextpmState.toString(16).padStart(2,'0')
-     + ' · mass '+(d.massOk?'<span class=ok>OK</span>':'<span class=err>FAIL</span>')
+  const per = d.postAvgSec;
+  const perLabel = per==10?'10 s':per==900?'15 min':'60 s';
+  const fmt = s => s==null?'—':s.toFixed(1);
+  const row = (lbl,s,isSel)=> '<tr'+(isSel?' style="background:#1b3a1b;color:#cfc"':'')
+    +'><td>'+lbl+(isSel?' ★':'')+'</td><td>'+fmt(s.pm1)+'</td><td>'+fmt(s.pm25)+'</td><td>'+fmt(s.pm10)
+    +'</td><td>'+s.cntPM1_dL+'</td><td>'+(s.ok?'<span class=ok>ok</span>':'<span class=err>fail</span>')+'</td></tr>';
+  h += '<div class="box"><b>NextPM</b> — période primaire : <b>'+perLabel+'</b>'
+     + '  <small>(<a href="/setperiod?sec=10">10s</a> · <a href="/setperiod?sec=60">60s</a> · <a href="/setperiod?sec=900">15m</a>)</small>'
+     + '<table style="width:100%;margin-top:6px;font-size:12px;border-collapse:collapse"><thead><tr style="color:#888">'
+     + '<th style="text-align:left">Moyennage</th><th>PM1</th><th>PM2.5</th><th>PM10</th><th>cnt≥0.3µm /dL</th><th>ok</th></tr></thead><tbody>'
+     + row('10 s',  d.pm_10s_pm1!=null?{pm1:d.pm_10s_pm1,pm25:d.pm_10s_pm25,pm10:d.pm_10s_pm10,cntPM1_dL:d.pm_10s_cntPM1_dL,ok:d.pm_10s_ok}:{pm1:null,pm25:null,pm10:null,cntPM1_dL:0,ok:false}, per==10)
+     + row('60 s',  {pm1:d.pm_60s_pm1,pm25:d.pm_60s_pm25,pm10:d.pm_60s_pm10,cntPM1_dL:d.pm_60s_cntPM1_dL,ok:d.pm_60s_ok}, per==60)
+     + row('15 min',{pm1:d.pm_15m_pm1,pm25:d.pm_15m_pm25,pm10:d.pm_15m_pm10,cntPM1_dL:d.pm_15m_cntPM1_dL,ok:d.pm_15m_ok}, per==900)
+     + '</tbody></table>'
+     + '<div class="u" style="margin-top:4px">state=0x'+d.nextpmState.toString(16).padStart(2,'0')
      + ' · modbus-bins '+(d.binsOk?'<span class=ok>OK</span>':'<span class=err>FAIL</span>')
-     + '<br>Cumulative counts (cnt/dL) from simple proto: ≥PM1='+d.cntPM1_dL+' · ≥PM2.5='+d.cntPM25_dL+' · ≥PM10='+d.cntPM10_dL
-     + '<br>Modbus bins Cnt/L: 0.2-0.5='+d.c02_05+' · 0.5-1='+d.c05_10+' · 1-2.5='+d.c10_25+' · 2.5-5='+d.c25_50+' · 5-10='+d.c50_100
-     + '</div>';
+     + '</div></div>';
   h += '<div class="box"><b>S8 CO₂:</b> '+(d.co2Ok?'<span class=ok>OK '+d.co2+' ppm</span>':'<span class=err>read failed</span>')+'</div>';
   h += '<div class="box"><b>Last cloud POST:</b> HTTP '+d.lastPostCode+' <span class="meta">'+esc(d.lastPostResp)+'</span></div>';
   h += '<div class="box"><b>Raw diagnostics</b>'
@@ -477,6 +500,21 @@ static void handleJson() {
   j += ",\"cntPM1_dL\":"  + String(latest.cntPM1_dL);
   j += ",\"cntPM25_dL\":" + String(latest.cntPM25_dL);
   j += ",\"cntPM10_dL\":" + String(latest.cntPM10_dL);
+  j += ",\"postAvgSec\":" + String(latest.postAvgSec);
+  // All three NextPM averaging periods
+  auto emitSample = [&](const char* pfx, const NextPMSample& s) {
+    j += String(",\"") + pfx + "_ok\":" + (s.ok ? "true" : "false");
+    j += String(",\"") + pfx + "_pm1\":"  + floatOrNull(s.pm1);
+    j += String(",\"") + pfx + "_pm25\":" + floatOrNull(s.pm25);
+    j += String(",\"") + pfx + "_pm10\":" + floatOrNull(s.pm10);
+    j += String(",\"") + pfx + "_cntPM1_dL\":"  + String(s.cntPM1_dL);
+    j += String(",\"") + pfx + "_cntPM25_dL\":" + String(s.cntPM25_dL);
+    j += String(",\"") + pfx + "_cntPM10_dL\":" + String(s.cntPM10_dL);
+    j += String(",\"") + pfx + "_state\":" + String(s.state);
+  };
+  emitSample("pm_10s", latest.avg10s);
+  emitSample("pm_60s", latest.avg60s);
+  emitSample("pm_15m", latest.avg15m);
   j += ",\"co2\":"      + String(latest.co2);
   j += ",\"co2Ok\":"    + String(latest.co2Ok ? "true" : "false");
   j += ",\"atmp\":"    + floatOrNull(latest.atmp, 2);
@@ -743,6 +781,40 @@ static void handleI2CScan() {
   webServer.send(200, "text/plain", out);
 }
 
+// ==================== Averaging period management ====
+static uint16_t loadSavedPostAvgSec() {
+  prefs.begin("ag", true);
+  uint16_t v = prefs.getUShort("avgsec", 60);
+  prefs.end();
+  if (v != 10 && v != 60 && v != 900) v = 60;
+  return v;
+}
+
+static void savePostAvgSec(uint16_t v) {
+  prefs.begin("ag", false);
+  prefs.putUShort("avgsec", v);
+  prefs.end();
+}
+
+static void handleSetPeriod() {
+  if (!webServer.hasArg("sec")) {
+    webServer.send(400, "text/plain",
+      "missing ?sec=10 | 60 | 900\n"
+      "current: " + String(latest.postAvgSec) + " s\n");
+    return;
+  }
+  long v = webServer.arg("sec").toInt();
+  if (v != 10 && v != 60 && v != 900) {
+    webServer.send(400, "text/plain", "sec must be 10, 60, or 900\n");
+    return;
+  }
+  latest.postAvgSec = (uint16_t)v;
+  savePostAvgSec(latest.postAvgSec);
+  webServer.send(200, "text/plain",
+    "Averaging period set to " + String(latest.postAvgSec) + " s.\n"
+    "Applied to next POST cycle.\n");
+}
+
 // ==================== ID management endpoints ========
 static void handleSetId() {
   if (!webServer.hasArg("id")) {
@@ -796,7 +868,8 @@ void setup() {
     gSensorIdFull = String("airgradient:") + agSerial12();
     saveSensorId(gSensorIdFull);
   }
-  Serial.printf("DeviceID (%s)\n", gSensorIdFull.c_str());
+  latest.postAvgSec = loadSavedPostAvgSec();
+  Serial.printf("DeviceID (%s) postAvgSec=%u s\n", gSensorIdFull.c_str(), latest.postAvgSec);
 
   NextPMSerial.begin(115200, SERIAL_8E1, NEXTPM_RX_PIN, NEXTPM_TX_PIN);
   NextPMSerial.setTimeout(60);
@@ -824,6 +897,7 @@ void setup() {
     webServer.on("/clearid", handleClearId);
     webServer.on("/macinfo", handleMacInfo);
     webServer.on("/i2cscan", handleI2CScan);
+    webServer.on("/setperiod", handleSetPeriod);
     webServer.begin();
     Serial.printf("HTTP server up: http://%s/\n", WiFi.localIP().toString().c_str());
   }
@@ -849,24 +923,36 @@ void loop() {
   if (millis() - tLastPost > POST_PERIOD_MS) {
     tLastPost = millis();
 
-    float pm1 = NAN, pm25 = NAN, pm10 = NAN;
-    uint16_t cnt1 = 0, cnt25 = 0, cnt10 = 0;
-    uint8_t st = 0xFF;
-    String rawMass;
-    bool okMass = nextpmReadMass(pm1, pm25, pm10, cnt1, cnt25, cnt10, &st, rawMass);
-    latest.nextpmMassRaw = rawMass;
+    // Query all 3 averaging periods (10 s, 60 s, 15 min). Small gap between requests.
+    nextpmReadMassCmd(0x11, latest.avg10s); delay(80);
+    nextpmReadMassCmd(0x12, latest.avg60s); delay(80);
+    nextpmReadMassCmd(0x13, latest.avg15m);
+
+    // Pick the primary (mirrored to top-level + used in AirGradient POST)
+    const NextPMSample* sel = &latest.avg60s;
+    if      (latest.postAvgSec == 10)  sel = &latest.avg10s;
+    else if (latest.postAvgSec == 900) sel = &latest.avg15m;
+    else                               sel = &latest.avg60s;
+
+    float pm1 = sel->pm1, pm25 = sel->pm25, pm10 = sel->pm10;
+    uint16_t cnt1 = sel->cntPM1_dL, cnt25 = sel->cntPM25_dL, cnt10 = sel->cntPM10_dL;
+    bool okMass = sel->ok;
+
+    latest.nextpmMassRaw = sel->rawHex;
     latest.massOk = okMass;
     int pm003_dL = -1;
     if (okMass) {
-      latest.pm1 = pm1; latest.pm25 = pm25; latest.pm10 = pm10; latest.nextpmState = st;
+      latest.pm1 = pm1; latest.pm25 = pm25; latest.pm10 = pm10; latest.nextpmState = sel->state;
       latest.cntPM1_dL = cnt1; latest.cntPM25_dL = cnt25; latest.cntPM10_dL = cnt10;
-      // cnt PM1-cut is cumulative count >= ~0.3 µm per 0.1L (= per dL) -> direct pm003Count
       pm003_dL = (int)cnt1;
       latest.pm003_dL = pm003_dL;
-      Serial.printf("Mass: PM1=%.1f PM2.5=%.1f PM10=%.1f state=0x%02X  cnt/dL: PM1=%u PM2.5=%u PM10=%u\n",
-                    pm1, pm25, pm10, st, cnt1, cnt25, cnt10);
+      Serial.printf("NextPM [%us]: PM1=%.1f PM2.5=%.1f PM10=%.1f state=0x%02X | 10s=%.1f/%.1f/%.1f 60s=%.1f/%.1f/%.1f 15m=%.1f/%.1f/%.1f\n",
+                    latest.postAvgSec, pm1, pm25, pm10, sel->state,
+                    latest.avg10s.pm1, latest.avg10s.pm25, latest.avg10s.pm10,
+                    latest.avg60s.pm1, latest.avg60s.pm25, latest.avg60s.pm10,
+                    latest.avg15m.pm1, latest.avg15m.pm25, latest.avg15m.pm10);
     } else {
-      Serial.printf("NextPM mass FAIL raw=[%s]\n", rawMass.c_str());
+      Serial.printf("NextPM mass FAIL (sel %us) raw=[%s]\n", latest.postAvgSec, latest.nextpmMassRaw.c_str());
     }
 
     // Optional: still try the Modbus bins so we can see raw response.
