@@ -1,0 +1,12 @@
+# Claude Code local session state
+.claude/
+
+# Build artifacts
+build/
+*.bin
+*.elf
+
+# Local secrets (never commit the device token / .env)
+.env
+backend-staging/openair/.env
+backend-staging/openair/pb_data/

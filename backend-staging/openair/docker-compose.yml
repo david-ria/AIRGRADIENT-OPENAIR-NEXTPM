@@ -1,0 +1,46 @@
+services:
+  pocketbase:
+    image: ghcr.io/muchobien/pocketbase:latest
+    container_name: openair-pocketbase
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Paris
+      # Shared secret pour l'ingestion firmware. Lu par pb_hooks/readings.pb.js
+      # (header X-Device-Token). À mettre dans /root/openair/.env, jamais commit.
+      - OPENAIR_DEVICE_TOKEN=${OPENAIR_DEVICE_TOKEN}
+    volumes:
+      - ./pb_data:/pb_data
+      - ./pb_migrations:/pb_migrations
+      - ./pb_hooks:/pb_hooks
+      - ./pb_public:/pb_public
+    ports:
+      - "127.0.0.1:8092:8090"   # debug local uniquement — accès public via Traefik
+    networks:
+      - root_default
+    labels:
+      - traefik.enable=true
+      # Router 1 : hostname Hostinger (cert immédiat, fallback de test)
+      - traefik.http.routers.openair.rule=Host(`openair.srv1092055.hstgr.cloud`)
+      - traefik.http.routers.openair.tls=true
+      - traefik.http.routers.openair.entrypoints=web,websecure
+      - traefik.http.routers.openair.tls.certresolver=mytlschallenge
+      # Router 2 : domaine final station.airsentinels.fr
+      - traefik.http.routers.openaircustom.rule=Host(`station.airsentinels.fr`)
+      - traefik.http.routers.openaircustom.tls=true
+      - traefik.http.routers.openaircustom.entrypoints=web,websecure
+      - traefik.http.routers.openaircustom.tls.certresolver=mytlschallenge
+      - traefik.http.services.openair.loadbalancer.server.port=8090
+      # Cache-Control no-cache pour que le frontend ne serve pas du périmé
+      - traefik.http.middlewares.openair-nocache.headers.customResponseHeaders.Cache-Control=no-cache
+      - traefik.http.routers.openair.middlewares=openair-nocache@docker
+      - traefik.http.routers.openaircustom.middlewares=openair-nocache@docker
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8090/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  root_default:
+    external: true

@@ -1,6 +1,6 @@
 # AIRGRADIENT-OPENAIR-NEXTPM
 
-ESP32-C3 firmware for an AirGradient-compatible OpenAir board equipped with a **NextPM** particulate matter sensor, **Senseair S8** CO₂ sensor, and **Sensirion SGP41** gas sensor (TVOC/NOx). Publishes to the **AirGradient Cloud** and exposes a **local web dashboard + JSON API** for direct monitoring and diagnostics.
+ESP32-C3 firmware for an AirGradient-compatible OpenAir board equipped with a **NextPM** particulate matter sensor, **Senseair S8** CO₂ sensor, and **Sensirion SGP41** gas sensor (TVOC/NOx). Publishes to the **AirSentinels backend** (`station.airsentinels.fr`, PocketBase) over HTTPS and exposes a **local web dashboard + JSON API** for direct monitoring and diagnostics.
 
 ---
 
@@ -15,10 +15,11 @@ ESP32-C3 firmware for an AirGradient-compatible OpenAir board equipped with a **
   - TVOC index and NOx index via the official Sensirion Gas Index Algorithm (1 Hz sampling, ~2-5 min baseline)
 - **Sensirion SHT4x** (I²C @ 0x44, optional — skipped if not detected)
   - Temperature (°C) and Relative Humidity (%) — used to compensate SGP41 readings
-- Local **Wi-Fi captive portal** on first boot (SSID `airgradient-xxxxxx`, password `cleanair`) to configure Wi-Fi and Sensor ID
-- **Persistent Sensor ID** in NVS (defaults to the STA MAC)
+- Local **Wi-Fi captive portal** on first boot (SSID `airgradient-xxxxxx`, password `cleanair`) to configure Wi-Fi, Sensor ID, and the **AirSentinels device token**
+- **Persistent Sensor ID** in NVS (defaults to the STA MAC) — `device_serial` = the bare 12-hex
 - **Local HTTP dashboard** on the device's LAN IP — see *Endpoints* below
-- Posts to AirGradient Cloud every **30 s** (free-tier friendly; previous 10 s was hit by HTTP 429)
+- Posts to the **AirSentinels backend** every **30 s** over HTTPS (TLS, ISRG Root X1 pinned), authenticated with the device token (`X-Device-Token` header)
+- **NTP-synced UTC timestamps** (`ts`); if NTP isn't synced yet the server stamps ingestion time
 
 ---
 
@@ -34,36 +35,60 @@ USB-CDC is used for `Serial` console (no pin conflict with UART0).
 
 ---
 
-## AirGradient Cloud
+## AirSentinels backend
 
-JSON `POST` every 30 s to:
+JSON `POST` every 30 s over HTTPS to:
 
 ```
-http://hw.airgradient.com/sensors/airgradient:<serial>/measures
+https://station.airsentinels.fr/api/openair/ingest
 ```
 
-where `<serial>` = STA MAC, lowercase, no colons.
+Headers: `Content-Type: application/json` and `X-Device-Token: <device token>`.
+TLS validated against the pinned **ISRG Root X1** root CA (Let's Encrypt).
+
+The backend is a PocketBase instance behind Traefik. The ingest hook resolves
+`device_serial → device`, auto-creating the device on first contact, and writes
+a row to the `readings` collection.
 
 ### Example payload
 
 ```json
 {
-  "wifi": -43,
-  "pm01": 2.1,
-  "pm02": 3.4,
+  "device_serial": "d83bda1d7888",
+  "ts": "2026-06-25T07:35:00Z",
+  "rssi": -43,
+  "postAvgSec": 60,
+  "pm1": 2.1,
+  "pm25": 3.4,
   "pm10": 5.6,
-  "pm003Count": 32,
-  "rco2": 502,
+  "pm003_dL": 32,
+  "cntPM1_dL": 32,
+  "pm_60s_ok": true,
+  "pm_60s_pm25": 3.4,
+  "co2": 502,
   "atmp": 24.60,
   "rhum": 51.20,
   "tvoc_index": 43,
   "nox_index": 1,
-  "tvoc_raw": 27437,
-  "nox_raw": 15516
+  "tvoc_index_avg": 41,
+  "nox_index_avg": 1,
+  "sensor_ok": true,
+  "sgpConditioning": false
 }
 ```
 
-Fields are included only when the corresponding sensor read succeeded. `tvoc_index` / `nox_index` are suppressed during the first ~10 s (SGP41 conditioning).
+Fields are included only when the corresponding sensor read succeeded. The three
+NextPM averaging windows (`pm_10s_*`, `pm_60s_*`, `pm_15m_*`) are all sent each
+cycle. `tvoc_index` / `nox_index` are suppressed during the first ~10 s (SGP41
+conditioning). `ts` is omitted until NTP syncs, in which case the server stamps it.
+
+### Provisioning a station
+
+On first boot, connect to the captive portal (`airgradient-xxxxxx` / `cleanair`)
+and fill in: Wi-Fi credentials, optional Sensor ID, and the **AirSentinels device
+token**. The token is the shared secret stored server-side in `/root/openair/.env`
+(`OPENAIR_DEVICE_TOKEN`). It is persisted in NVS — re-entering it is only needed
+to rotate it.
 
 ---
 
@@ -119,9 +144,9 @@ Open `sketch/sketch.ino`, select **ESP32C3 Dev Module**, enable **USB CDC On Boo
 ## First-time setup
 
 1. Flash the firmware.
-2. A Wi-Fi AP named `airgradient-xxxxxx` appears (password `cleanair`). Connect, pick your SSID, optionally set a Sensor ID.
-3. The device restarts, connects to Wi-Fi, brings up the local dashboard and starts POSTing.
-4. Register the Sensor ID (shown on `/macinfo` as `STA MAC (ag serial)`) in your AirGradient account at <https://app.airgradient.com/>. Until this is done, POSTs return HTTP 400.
+2. A Wi-Fi AP named `airgradient-xxxxxx` appears (password `cleanair`). Connect, pick your SSID, set the **AirSentinels device token** (and optionally a Sensor ID).
+3. The device restarts, connects to Wi-Fi, syncs NTP, brings up the local dashboard and starts POSTing to `station.airsentinels.fr`.
+4. The device auto-registers in the backend on its first successful POST (a `devices` row keyed by `device_serial`). Check the PocketBase admin at <https://station.airsentinels.fr/_/>.
 
 ### If the stored ID doesn't match the chip MAC
 
@@ -138,6 +163,7 @@ http://<device-ip>/clearid             # reset to MAC-derived ID
 
 ## Notes
 
-- `pm003Count` is taken directly from the NextPM simple-protocol response (bytes 3-4), not from Modbus registers 128-137 — those turned out to be empty on this firmware revision.
+- `pm003_dL` is taken directly from the NextPM simple-protocol response (bytes 3-4), not from Modbus registers 128-137 — those turned out to be empty on this firmware revision.
 - SGP41 requires ~2-5 min of 1 Hz sampling before its gas index algorithm produces meaningful TVOC/NOx values. Early readings are `0` and will climb to ~100 in clean air.
-- POST period is 30 s. The AirGradient free tier rate-limits faster cadences with HTTP 429.
+- POST period is 30 s.
+- TLS uses a pinned root CA (ISRG Root X1, valid until 2035). Let's Encrypt rotates its *intermediates*, not the root, so the pin survives cert renewals. If the backend ever moves off Let's Encrypt, update `ISRG_ROOT_X1_PEM` in the firmware.

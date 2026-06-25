@@ -15,7 +15,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
+#include <time.h>
 #include <HardwareSerial.h>
 #include <Preferences.h>
 #include <WebServer.h>
@@ -42,7 +44,55 @@ HardwareSerial S8Serial(0);
 
 constexpr uint8_t  NEXTPM_MODBUS_ADDR = 0x01;
 constexpr float    PM003_FROM_02_05_FRACTION = 0.0f;
-constexpr uint32_t POST_PERIOD_MS = 30000;  // AirGradient free tier rate-limits below ~30 s
+constexpr uint32_t POST_PERIOD_MS = 30000;
+
+// -------------------- AirSentinels backend ----------
+// The station POSTs straight to our own backend (PocketBase behind Traefik TLS).
+// HTTPS only — Traefik 301/308-redirects :80 -> :443, so plain HTTP won't work.
+constexpr char AIRSENTINELS_HOST[] = "station.airsentinels.fr";
+constexpr char AIRSENTINELS_URL[]  = "https://station.airsentinels.fr/api/openair/ingest";
+
+// Pinned root CA: ISRG Root X1 (Let's Encrypt). Valid until 2035-06-04.
+// Pinning the *root* (not the rotating intermediate) protects the device token
+// from MITM without needing firmware updates when LE rotates intermediates.
+static const char ISRG_ROOT_X1_PEM[] = R"CERT(-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)CERT";
+
+// Device token (shared secret) sent in the X-Device-Token header. Persisted in
+// NVS, entered once via the Wi-Fi captive portal. Empty until provisioned.
+String gDeviceToken;
+// NTP clock state. Until synced we omit "ts" and let the server stamp ingestion.
+static bool gTimeSynced = false;
 
 // I2C pins (AirGradient OpenAir C3 board)
 constexpr int I2C_SDA = 7;
@@ -194,6 +244,42 @@ void saveSensorId(const String& fullId) {
   prefs.begin("ag", false);
   prefs.putString("id", fullId);
   prefs.end();
+}
+
+// device_serial sent to AirSentinels = the bare 12-hex, stripped of the legacy
+// "airgradient:" prefix. Honors a manual override set via /setid.
+String deviceSerial12() {
+  String s = gSensorIdFull;
+  s.toLowerCase();
+  if (s.startsWith("airgradient:")) s.remove(0, 12);
+  s.replace(":", ""); s.replace(" ", "");
+  if (s.length() != 12) return agSerial12();
+  return s;
+}
+
+String loadSavedToken() {
+  prefs.begin("ag", true);
+  String t = prefs.getString("tok", "");
+  prefs.end();
+  return t;
+}
+
+void saveToken(const String& t) {
+  prefs.begin("ag", false);
+  prefs.putString("tok", t);
+  prefs.end();
+}
+
+// ISO8601 UTC timestamp, e.g. 2026-06-25T07:35:00Z. Returns "" if NTP not synced.
+String isoUtcNow() {
+  if (!gTimeSynced) return String("");
+  time_t now = time(nullptr);
+  if (now < 1700000000) return String("");  // sanity: clock not set
+  struct tm tmv;
+  gmtime_r(&now, &tmv);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+  return String(buf);
 }
 
 // ==================== CRC / Checksum ==================
@@ -370,6 +456,15 @@ bool ensureWifiConnected() {
       idbuf, sizeof(idbuf) - 1);
   wm.addParameter(&idParam);
 
+  char tokbuf[80];
+  strncpy(tokbuf, gDeviceToken.c_str(), sizeof(tokbuf));
+  tokbuf[sizeof(tokbuf) - 1] = 0;
+  WiFiManagerParameter tokParam(
+      "devtoken",
+      "AirSentinels device token",
+      tokbuf, sizeof(tokbuf) - 1);
+  wm.addParameter(&tokParam);
+
   String apName = "airgradient-" + agSerial12().substring(6);
   const char* apPass = "cleanair";
   wm.setConfigPortalTimeout(180);
@@ -385,6 +480,14 @@ bool ensureWifiConnected() {
     Serial.printf("[ID] Nouveau Sensor ID: %s\n", gSensorIdFull.c_str());
   }
 
+  String enteredTok = String(tokParam.getValue());
+  enteredTok.trim();
+  if (enteredTok.length() > 0 && enteredTok != gDeviceToken) {
+    gDeviceToken = enteredTok;
+    saveToken(gDeviceToken);
+    Serial.println("[TOKEN] AirSentinels device token saved");
+  }
+
   if (ok) {
     Serial.printf("Wi-Fi OK: SSID=%s IP=%s RSSI=%d\n",
                   WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
@@ -394,39 +497,93 @@ bool ensureWifiConnected() {
   return ok;
 }
 
-// ==================== POST -> AirGradient =============
-static bool postToAirGradient(float pm01, float pm02, float pm10,
-                              int pm003Count_dL, int rco2ppm) {
+// ==================== POST -> AirSentinels ===========
+// Builds the native AirSentinels payload from `latest` and POSTs it over TLS to
+// our PocketBase ingest hook. device_serial + X-Device-Token identify the unit;
+// ts is sent only when NTP is synced (else the server stamps ingestion time).
+static bool postToAirSentinels() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[POST] No Wi-Fi.");
     return false;
   }
+  if (gDeviceToken.length() < 8) {
+    Serial.println("[POST] No device token — set it via the captive portal.");
+    latest.lastPostCode = -1;
+    latest.lastPostResp = "no token";
+    return false;
+  }
 
-  String url = String("http://hw.airgradient.com/sensors/") + gSensorIdFull + "/measures";
+  String payload = String("{\"device_serial\":\"") + deviceSerial12() + "\"";
+  String ts = isoUtcNow();
+  if (ts.length()) payload += String(",\"ts\":\"") + ts + "\"";
 
-  String payload = String("{\"wifi\":") + WiFi.RSSI();
-  if (!isnan(pm01))       payload += String(",\"pm01\":") + String(pm01, 1);
-  if (!isnan(pm02))       payload += String(",\"pm02\":") + String(pm02, 1);
-  if (!isnan(pm10))       payload += String(",\"pm10\":") + String(pm10, 1);
-  if (pm003Count_dL >= 0) payload += String(",\"pm003Count\":") + pm003Count_dL;
-  if (rco2ppm >= 0)       payload += String(",\"rco2\":") + rco2ppm;
+  payload += String(",\"rssi\":") + WiFi.RSSI();
+  payload += String(",\"postAvgSec\":") + latest.postAvgSec;
+
+  // Primary mirror (selected window) — only when this cycle's mass read was OK,
+  // so we never POST stale PM from a previous successful cycle.
+  if (latest.massOk) {
+    if (!isnan(latest.pm1))  payload += String(",\"pm1\":")  + String(latest.pm1, 1);
+    if (!isnan(latest.pm25)) payload += String(",\"pm25\":") + String(latest.pm25, 1);
+    if (!isnan(latest.pm10)) payload += String(",\"pm10\":") + String(latest.pm10, 1);
+    if (latest.pm003_dL >= 0) payload += String(",\"pm003_dL\":") + latest.pm003_dL;
+    payload += String(",\"cntPM1_dL\":")  + latest.cntPM1_dL;
+    payload += String(",\"cntPM25_dL\":") + latest.cntPM25_dL;
+    payload += String(",\"cntPM10_dL\":") + latest.cntPM10_dL;
+  }
+  // Modbus binned counts (usually empty on this FW revision, kept for forward-compat)
+  if (latest.binsOk) {
+    payload += String(",\"c02_05\":")  + String((uint32_t)latest.c02_05);
+    payload += String(",\"c05_10\":")  + String((uint32_t)latest.c05_10);
+    payload += String(",\"c10_25\":")  + String((uint32_t)latest.c10_25);
+    payload += String(",\"c25_50\":")  + String((uint32_t)latest.c25_50);
+    payload += String(",\"c50_100\":") + String((uint32_t)latest.c50_100);
+  }
+
+  // All three NextPM averaging windows
+  auto emitWin = [&](const char* pfx, const NextPMSample& s) {
+    payload += String(",\"") + pfx + "_ok\":" + (s.ok ? "true" : "false");
+    if (s.ok) {
+      payload += String(",\"") + pfx + "_pm1\":"  + String(s.pm1, 1);
+      payload += String(",\"") + pfx + "_pm25\":" + String(s.pm25, 1);
+      payload += String(",\"") + pfx + "_pm10\":" + String(s.pm10, 1);
+      payload += String(",\"") + pfx + "_cntPM1_dL\":"  + s.cntPM1_dL;
+      payload += String(",\"") + pfx + "_cntPM25_dL\":" + s.cntPM25_dL;
+      payload += String(",\"") + pfx + "_cntPM10_dL\":" + s.cntPM10_dL;
+    }
+  };
+  emitWin("pm_10s", latest.avg10s);
+  emitWin("pm_60s", latest.avg60s);
+  emitWin("pm_15m", latest.avg15m);
+
+  if (latest.co2Ok) payload += String(",\"co2\":") + latest.co2;
   if (latest.shtOk) {
     payload += String(",\"atmp\":") + String(latest.atmp, 2);
     payload += String(",\"rhum\":") + String(latest.rhum, 2);
   }
   if (latest.sgpOk && !latest.sgpConditioning) {
-    // Use the 10 s rolling average to prevent sawtooth on the cloud graph
-    payload += String(",\"tvoc_index\":") + String(latest.vocIndexAvg);
-    payload += String(",\"nox_index\":")  + String(latest.noxIndexAvg);
-    payload += String(",\"tvoc_raw\":")   + String(latest.sgpSrawVoc);
-    payload += String(",\"nox_raw\":")    + String(latest.sgpSrawNox);
+    payload += String(",\"tvoc_index\":")     + String(latest.vocIndex);
+    payload += String(",\"nox_index\":")      + String(latest.noxIndex);
+    payload += String(",\"tvoc_index_avg\":") + String(latest.vocIndexAvg);
+    payload += String(",\"nox_index_avg\":")  + String(latest.noxIndexAvg);
+    payload += String(",\"tvoc_raw\":")       + String(latest.sgpSrawVoc);
+    payload += String(",\"nox_raw\":")        + String(latest.sgpSrawNox);
   }
+  payload += String(",\"sensor_ok\":") + ((latest.massOk && latest.co2Ok) ? "true" : "false");
+  payload += String(",\"sgpConditioning\":") + (latest.sgpConditioning ? "true" : "false");
   payload += "}";
 
-  WiFiClient client;
+  WiFiClientSecure client;
+  client.setCACert(ISRG_ROOT_X1_PEM);
   HTTPClient http;
-  http.begin(client, url);
-  http.addHeader("content-type", "application/json");
+  if (!http.begin(client, AIRSENTINELS_URL)) {
+    Serial.println("[POST] http.begin failed");
+    latest.lastPostCode = -2;
+    latest.lastPostResp = "begin fail";
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Token", gDeviceToken);
   int code = http.POST(payload);
   String resp = http.getString();
   http.end();
@@ -972,7 +1129,10 @@ void setup() {
     saveSensorId(gSensorIdFull);
   }
   latest.postAvgSec = loadSavedPostAvgSec();
-  Serial.printf("DeviceID (%s) postAvgSec=%u s\n", gSensorIdFull.c_str(), latest.postAvgSec);
+  gDeviceToken = loadSavedToken();
+  Serial.printf("DeviceID (%s) serial=%s postAvgSec=%u s token=%s\n",
+                gSensorIdFull.c_str(), deviceSerial12().c_str(), latest.postAvgSec,
+                gDeviceToken.length() ? "set" : "MISSING");
 
   NextPMSerial.begin(115200, SERIAL_8E1, NEXTPM_RX_PIN, NEXTPM_TX_PIN);
   NextPMSerial.setTimeout(60);
@@ -991,6 +1151,20 @@ void setup() {
   ensureWifiConnected();
 
   if (WiFi.status() == WL_CONNECTED) {
+    // NTP so we can stamp ingestion with real UTC time. Non-blocking: the gas
+    // task and POST loop keep running; isoUtcNow() returns "" until synced and
+    // the server stamps in the meantime.
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    struct tm tmv;
+    if (getLocalTime(&tmv, 5000)) {
+      gTimeSynced = true;
+      Serial.printf("NTP synced: %04d-%02d-%02dT%02d:%02d:%02dZ\n",
+                    tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                    tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    } else {
+      Serial.println("NTP not synced yet (server will stamp ts)");
+    }
+
     if (MDNS.begin("openair-nextpm")) {
       MDNS.addService("http", "tcp", 80);
       Serial.println("mDNS: openair-nextpm.local");
@@ -1083,11 +1257,7 @@ void loop() {
     latest.lastUpdateMs = millis();
 
     if (okMass || okBins || okCO2) {
-      postToAirGradient(okMass ? pm1 : NAN,
-                        okMass ? pm25 : NAN,
-                        okMass ? pm10 : NAN,
-                        pm003_dL,
-                        okCO2 ? (int)co2 : -1);
+      postToAirSentinels();
     }
   }
 }
