@@ -25,7 +25,7 @@ routerAdd("POST", "/api/openair/ingest", (e) => {
       "pm_10s_ok","pm_60s_ok","pm_15m_ok","sensor_ok","sgpConditioning",
     ];
 
-    const shape = { device_serial: "", ts: "" };
+    const shape = { device_serial: "", ts: "", fw_version: "" };
     for (const k of ALLOWED_NUM)  shape[k] = -0.0;  // float64, not int64
     for (const k of ALLOWED_BOOL) shape[k] = false;
 
@@ -71,6 +71,7 @@ routerAdd("POST", "/api/openair/ingest", (e) => {
     $app.save(reading);
 
     device.set("last_seen", ts);
+    if (data.fw_version && data.fw_version.length > 0) device.set("fw_version", data.fw_version);
     $app.save(device);
 
     return e.json(200, { id: reading.id, device: device.id });

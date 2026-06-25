@@ -17,6 +17,8 @@
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
 #include <time.h>
 #include <HardwareSerial.h>
 #include <Preferences.h>
@@ -93,6 +95,17 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 String gDeviceToken;
 // NTP clock state. Until synced we omit "ts" and let the server stamp ingestion.
 static bool gTimeSynced = false;
+
+// -------------------- OTA (pull-based) ---------------
+// Bump on every release. The OTA manifest's "version" is compared against this;
+// if different, the station downloads and flashes the new image.
+constexpr char FW_VERSION[]       = "2026.06.25-1";
+constexpr char OTA_MANIFEST_URL[] = "https://station.airsentinels.fr/firmware/openair-nextpm.json";
+constexpr uint32_t OTA_CHECK_PERIOD_MS    = 6UL * 3600UL * 1000UL;  // re-check every 6 h
+constexpr uint32_t OTA_FIRST_CHECK_MS     = 45UL * 1000UL;          // first check 45 s after boot
+constexpr uint32_t OTA_CONFIRM_TIMEOUT_MS = 5UL * 60UL * 1000UL;    // a fresh image must POST OK within 5 min
+static bool     gOtaPendingConfirm = false;  // booted a freshly OTA'd image, not yet confirmed
+static uint32_t gBootMs = 0;
 
 // I2C pins (AirGradient OpenAir C3 board)
 constexpr int I2C_SDA = 7;
@@ -519,6 +532,7 @@ static bool postToAirSentinels() {
 
   payload += String(",\"rssi\":") + WiFi.RSSI();
   payload += String(",\"postAvgSec\":") + latest.postAvgSec;
+  payload += String(",\"fw_version\":\"") + FW_VERSION + "\"";
 
   // Primary mirror (selected window) — only when this cycle's mass read was OK,
   // so we never POST stale PM from a previous successful cycle.
@@ -1115,11 +1129,143 @@ static void handleMacInfo() {
   webServer.send(200, "text/plain", out);
 }
 
+// ==================== OTA pull ========================
+// Minimal JSON field extractor (no ArduinoJson dependency). Handles
+// "key":"string" and "key":number. Returns "" if not found.
+static String jsonField(const String& json, const char* key) {
+  String k = String("\"") + key + "\"";
+  int i = json.indexOf(k);
+  if (i < 0) return String("");
+  i = json.indexOf(':', i + k.length());
+  if (i < 0) return String("");
+  i++;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+  if (i >= (int)json.length()) return String("");
+  if (json[i] == '"') {
+    int j = json.indexOf('"', i + 1);
+    if (j < 0) return String("");
+    return json.substring(i + 1, j);
+  }
+  int j = i;
+  while (j < (int)json.length() &&
+         json[j] != ',' && json[j] != '}' && json[j] != ' ' && json[j] != '\n' && json[j] != '\r') j++;
+  return json.substring(i, j);
+}
+
+// Called once at boot to reconcile NVS OTA marker with the running version.
+static void otaInitBootState() {
+  prefs.begin("ag", true);
+  String tried = prefs.getString("otaver", "");
+  prefs.end();
+  if (tried.length() == 0) return;
+  if (tried == String(FW_VERSION)) {
+    // We're running exactly the version we just installed → success path, but
+    // we only *confirm* (cancel rollback) after a real POST succeeds.
+    gOtaPendingConfirm = true;
+    Serial.printf("[OTA] running freshly installed %s — awaiting POST to confirm\n", FW_VERSION);
+  } else {
+    // Running a different version than the one we tried to install: the new
+    // image never took (or the bootloader already rolled us back). Clear it.
+    prefs.begin("ag", false); prefs.remove("otaver"); prefs.end();
+    Serial.printf("[OTA] cleared stale install marker (%s, running %s)\n", tried.c_str(), FW_VERSION);
+  }
+}
+
+// Confirm the freshly installed image is healthy (called after a successful POST).
+static void otaConfirmSuccess() {
+  if (!gOtaPendingConfirm) return;
+  gOtaPendingConfirm = false;
+  prefs.begin("ag", false); prefs.remove("otaver"); prefs.end();
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t st;
+  if (running && esp_ota_get_state_partition(running, &st) == ESP_OK &&
+      st == ESP_OTA_IMG_PENDING_VERIFY) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    Serial.println("[OTA] image confirmed valid (rollback cancelled)");
+  } else {
+    Serial.println("[OTA] image confirmed (no pending-verify state)");
+  }
+}
+
+// If a fresh image never produced a successful POST within the timeout, revert
+// to the previous slot. Works even when bootloader rollback isn't compiled in,
+// by manually re-pointing the boot partition to the other OTA slot.
+static void otaRollbackIfStuck() {
+  if (!gOtaPendingConfirm) return;
+  if (millis() - gBootMs < OTA_CONFIRM_TIMEOUT_MS) return;
+  Serial.println("[OTA] fresh image failed to confirm in time — rolling back");
+  prefs.begin("ag", false); prefs.remove("otaver"); prefs.end();
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t st;
+  if (running && esp_ota_get_state_partition(running, &st) == ESP_OK &&
+      st == ESP_OTA_IMG_PENDING_VERIFY) {
+    esp_ota_mark_app_invalid_rollback_and_reboot();  // does not return
+  }
+  // Fallback: point boot at the other slot (holds the previous firmware) and reboot.
+  const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+  if (other) esp_ota_set_boot_partition(other);
+  delay(100);
+  ESP.restart();
+}
+
+static void otaCheckAndApply() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  // Don't chase a new update until the current fresh image is confirmed.
+  if (gOtaPendingConfirm) return;
+
+  WiFiClientSecure client;
+  client.setCACert(ISRG_ROOT_X1_PEM);
+  HTTPClient http;
+  if (!http.begin(client, OTA_MANIFEST_URL)) return;
+  int code = http.GET();
+  if (code != 200) { Serial.printf("[OTA] manifest HTTP %d\n", code); http.end(); return; }
+  String body = http.getString();
+  http.end();
+
+  String version = jsonField(body, "version");
+  String url     = jsonField(body, "url");
+  String md5     = jsonField(body, "md5");
+  long   size    = jsonField(body, "size").toInt();
+  if (version.length() == 0 || url.length() == 0) { Serial.println("[OTA] bad manifest"); return; }
+  if (version == String(FW_VERSION)) { Serial.printf("[OTA] up to date (%s)\n", FW_VERSION); return; }
+
+  Serial.printf("[OTA] update %s -> %s, downloading %s\n", FW_VERSION, version.c_str(), url.c_str());
+  WiFiClientSecure dlc;
+  dlc.setCACert(ISRG_ROOT_X1_PEM);
+  HTTPClient dl;
+  if (!dl.begin(dlc, url)) { Serial.println("[OTA] dl begin fail"); return; }
+  int dcode = dl.GET();
+  if (dcode != 200) { Serial.printf("[OTA] bin HTTP %d\n", dcode); dl.end(); return; }
+
+  int len = dl.getSize();
+  if (size > 0) len = (int)size;
+  if (!Update.begin(len > 0 ? len : UPDATE_SIZE_UNKNOWN)) {
+    Serial.printf("[OTA] Update.begin fail: %s\n", Update.errorString());
+    dl.end(); return;
+  }
+  if (md5.length() == 32) Update.setMD5(md5.c_str());  // verified during write
+
+  WiFiClient* stream = dl.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+  dl.end();
+  Serial.printf("[OTA] wrote %u bytes\n", (unsigned)written);
+
+  if (!Update.end(true)) {
+    Serial.printf("[OTA] Update.end fail: %s\n", Update.errorString());
+    return;  // MD5/size mismatch or write error → nothing flashed to boot slot
+  }
+  prefs.begin("ag", false); prefs.putString("otaver", version); prefs.end();
+  Serial.println("[OTA] update OK — rebooting into new image");
+  delay(200);
+  ESP.restart();
+}
+
 // ==================== Setup / Loop ====================
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\nBoot");
+  gBootMs = millis();
+  Serial.printf("\nBoot — firmware %s\n", FW_VERSION);
 
   WiFi.mode(WIFI_STA);
 
@@ -1130,6 +1276,7 @@ void setup() {
   }
   latest.postAvgSec = loadSavedPostAvgSec();
   gDeviceToken = loadSavedToken();
+  otaInitBootState();
   Serial.printf("DeviceID (%s) serial=%s postAvgSec=%u s token=%s\n",
                 gSensorIdFull.c_str(), deviceSerial12().c_str(), latest.postAvgSec,
                 gDeviceToken.length() ? "set" : "MISSING");
@@ -1184,7 +1331,7 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t tLastPost = 0, tTick = 0, tLastGas = 0;
+  static uint32_t tLastPost = 0, tTick = 0, tLastGas = 0, tLastOta = 0;
   webServer.handleClient();
 
   if (millis() - tTick > 2000) {
@@ -1195,6 +1342,15 @@ void loop() {
 
   // Gas sampling lives in its own FreeRTOS task (see gasSensorTask).
   (void)tLastGas;
+
+  // OTA: first check shortly after boot, then on a slow cadence. Roll back a
+  // fresh image that never managed a successful POST.
+  otaRollbackIfStuck();
+  uint32_t otaDue = (tLastOta == 0) ? OTA_FIRST_CHECK_MS : OTA_CHECK_PERIOD_MS;
+  if (WiFi.status() == WL_CONNECTED && millis() - tLastOta > otaDue) {
+    tLastOta = millis();
+    otaCheckAndApply();
+  }
 
   if (millis() - tLastPost > POST_PERIOD_MS) {
     tLastPost = millis();
@@ -1257,7 +1413,7 @@ void loop() {
     latest.lastUpdateMs = millis();
 
     if (okMass || okBins || okCO2) {
-      postToAirSentinels();
+      if (postToAirSentinels()) otaConfirmSuccess();
     }
   }
 }

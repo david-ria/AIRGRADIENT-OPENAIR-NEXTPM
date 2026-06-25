@@ -92,6 +92,32 @@ to rotate it.
 
 ---
 
+## OTA updates (pull-based)
+
+Stations update themselves over the air — no field visits to reflash. The flow:
+
+1. Each release bumps `FW_VERSION` in `src/main.cpp`.
+2. `scripts/publish-firmware.sh` compiles, computes the MD5, and uploads the
+   binary + a manifest to `station.airsentinels.fr/firmware/`.
+3. Deployed stations poll `firmware/openair-nextpm.json` (45 s after boot, then
+   every 6 h). If `version` differs from their `FW_VERSION`, they download the
+   `.bin` over the same pinned-TLS channel, verify the MD5 during write
+   (`Update.setMD5`), flash the spare OTA slot, and reboot.
+4. **Self-healing:** a freshly installed image must produce a successful POST
+   within 5 min or it rolls back to the previous slot. The `min_spiffs`
+   partition scheme already provides two ~1.9 MB OTA slots, so no repartition is
+   needed.
+
+Publish a new release:
+
+```bash
+# bump FW_VERSION in src/main.cpp first, mirror to sketch/, then:
+scripts/publish-firmware.sh
+```
+
+The manifest is uploaded last and atomically, so a station never sees a manifest
+pointing at a binary that isn't there yet.
+
 ## Local Dashboard & Endpoints
 
 Once connected to Wi-Fi the device serves:
