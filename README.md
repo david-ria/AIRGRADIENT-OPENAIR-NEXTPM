@@ -120,6 +120,38 @@ scripts/publish-firmware.sh
 The manifest is uploaded last and atomically, so a station never sees a manifest
 pointing at a binary that isn't there yet.
 
+## OpenAQ-format API (for third-party / ExpoTrack)
+
+The backend exposes the readings in the **OpenAQ measurement shape** so any
+OpenAQ-aware consumer (e.g. the VLEP **ExpoTrack** dashboard) can ingest the
+stations through a stable, standard contract — decoupled from the internal
+PocketBase schema, and without leaking device telemetry (IP / heap / reset).
+
+```
+GET https://station.airsentinels.fr/api/openaq/locations
+GET https://station.airsentinels.fr/api/openaq/measurements
+      ?location=<device_serial>     # e.g. d83bda1d7888
+      &parameter=<code>             # optional: pm25, pm10, co2, ...
+      &date_from=<YYYY-MM-DD HH:MM:SS>   # optional (UTC)
+      &date_to=<...>                # optional
+      &limit=<n>                    # readings, default 100, max 500
+      &page=<n>
+```
+
+Each reading is **unpivoted into one measurement per channel** (everything the
+sensor produces). Channels that aren't available (granulometry bins on an older
+NextPM firmware, T/RH with no SHT4x, gas during warm-up) are skipped, not sent
+as `0`. Response is the OpenAQ `{ meta, results }` envelope; `Access-Control-Allow-Origin: *`
+is set for browser consumers.
+
+Parameters exposed: `pm1`, `pm25`, `pm10` (ug/m3); `pm1_number`, `pm25_number`,
+`pm10_number` (particles/mL); `pm_bin_0.3_0.5 … pm_bin_5_10` (particles/L, when
+the NextPM firmware supports the bin commands); `co2` (ppm); `vocindex`,
+`noxindex` (index); `temperature` (c); `relativehumidity` (%).
+
+> Coordinates come from the device's linked `site` (lat/lon). Assign a station to
+> a site to populate `coordinates`; otherwise it's `null`.
+
 ## Local Dashboard & Endpoints
 
 Once connected to Wi-Fi the device serves:
