@@ -1,5 +1,7 @@
 # AIRGRADIENT-OPENAIR-NEXTPM
 
+[![firmware-build](https://github.com/david-ria/AIRGRADIENT-OPENAIR-NEXTPM/actions/workflows/firmware-build.yml/badge.svg)](https://github.com/david-ria/AIRGRADIENT-OPENAIR-NEXTPM/actions/workflows/firmware-build.yml)
+
 ESP32-C3 firmware for an AirGradient-compatible OpenAir board equipped with a **NextPM** particulate matter sensor, **Senseair S8** CO₂ sensor, and **Sensirion SGP41** gas sensor (TVOC/NOx). Publishes to the **AirSentinels backend** (`station.airsentinels.fr`, PocketBase) over HTTPS and exposes a **local web dashboard + JSON API** for direct monitoring and diagnostics.
 
 ---

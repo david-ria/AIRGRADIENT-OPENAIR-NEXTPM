@@ -1,0 +1,45 @@
+name: firmware-build
+
+# Build-check only: compiles the firmware with the pinned profile on every push /
+# PR that touches firmware files. No secrets, no VPS access, no OTA publish — it
+# just proves the code compiles reproducibly and uploads the .bin as an artifact.
+# (secrets.h is gitignored, so CI builds the clean token-free image automatically.)
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'sketch/**'
+      - 'scripts/**'
+      - '.github/workflows/firmware-build.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'sketch/**'
+      - 'scripts/**'
+  workflow_dispatch: {}   # allow manual runs from the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Mirror canonical source into the sketch target
+        run: cp src/main.cpp sketch/sketch.ino
+
+      - name: Compile (pinned profile)
+        run: arduino-cli compile --profile openair --output-dir build sketch
+
+      - name: Report size
+        run: ls -la build/sketch.ino.bin
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openair-nextpm-firmware
+          path: build/sketch.ino.bin
+          if-no-files-found: error
