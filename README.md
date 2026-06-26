@@ -141,25 +141,32 @@ mDNS alias: `http://openair-nextpm.local/` (works on OSes that resolve `.local`)
 
 ### Arduino CLI (recommended)
 
+`src/main.cpp` is the **canonical source**; `sketch/sketch.ino` is a generated
+mirror (the Arduino build target). The build scripts re-mirror automatically, so
+edit `src/main.cpp` and never hand-copy.
+
+Reproducible builds use the pinned profile in `sketch/sketch.yaml` (ESP32 core +
+every library locked to a known-good version):
+
 ```bash
-arduino-cli core install esp32:esp32
-arduino-cli lib install "WiFiManager" \
-                        "Sensirion I2C SGP41" \
-                        "Sensirion Gas Index Algorithm" \
-                        "Sensirion Core" \
-                        "Sensirion I2C SHT4x"
+# build (mirrors src -> sketch, compiles with the pinned profile)
+scripts/build.sh
 
-arduino-cli compile \
-  --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160,FlashFreq=80,FlashMode=qio" \
-  sketch
-
-arduino-cli upload \
-  --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160,FlashFreq=80,FlashMode=qio" \
-  --port COMxx \
-  sketch
+# build + flash
+scripts/build.sh --flash COMxx
 ```
 
-The `sketch/` folder is the Arduino-style build target. The same source is mirrored at `src/main.cpp` for PlatformIO users.
+Equivalent raw commands:
+
+```bash
+cp src/main.cpp sketch/sketch.ino
+arduino-cli compile --profile openair --output-dir build sketch
+arduino-cli upload  --profile openair --port COMxx --input-dir build sketch
+```
+
+For provisioning without the captive portal, copy `sketch/secrets.h.example` to
+`sketch/secrets.h` (gitignored) and fill in Wi-Fi creds + the device token.
+**Never** build a public OTA image with a real token in `secrets.h`.
 
 ### Arduino IDE
 

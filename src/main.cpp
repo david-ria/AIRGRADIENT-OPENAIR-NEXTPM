@@ -668,6 +668,7 @@ static String buildPayload() {
   payload += String(",\"outbox_depth\":") + gObCount;
   payload += String(",\"post_fail\":") + gPostFail;
   payload += String(",\"reset_reason\":\"") + resetReasonStr() + "\"";
+  payload += String(",\"ip\":\"") + WiFi.localIP().toString() + "\"";
   payload += "}";
   return payload;
 }
@@ -1228,6 +1229,38 @@ static void handleSetId() {
     "Next POST (within 10 s) will use this ID.\n");
 }
 
+// Rotate the AirSentinels device token over the LAN (no reflash). Persisted NVS.
+static void handleSetToken() {
+  if (!webServer.hasArg("token")) {
+    webServer.send(400, "text/plain",
+      String("missing ?token=...\ncurrent: ") + (gDeviceToken.length() ? "set" : "MISSING") + "\n");
+    return;
+  }
+  String t = webServer.arg("token"); t.trim();
+  if (t.length() < 8) { webServer.send(400, "text/plain", "token too short (>=8)\n"); return; }
+  gDeviceToken = t;
+  saveToken(gDeviceToken);
+  webServer.send(200, "text/plain",
+    "Token saved (" + String(t.length()) + " chars). Next POST uses it.\n");
+}
+
+// Switch the station to a new Wi-Fi over the LAN (e.g. rotate a hotspot password
+// across the fleet). Creds persist to NVS; the device will reconnect on its own.
+static void handleSetWifi() {
+  if (!webServer.hasArg("ssid")) {
+    webServer.send(400, "text/plain", "missing ?ssid=...&pass=...\n");
+    return;
+  }
+  String ssid = webServer.arg("ssid");
+  String pass = webServer.hasArg("pass") ? webServer.arg("pass") : "";
+  webServer.send(200, "text/plain",
+    "Switching to SSID '" + ssid + "'. The device changes networks now — "
+    "reconnect to its new IP (see /macinfo on the new network or the dashboard telemetry).\n");
+  delay(200);
+  WiFi.persistent(true);
+  WiFi.begin(ssid.c_str(), pass.c_str());  // saved to NVS, used on reconnect
+}
+
 static void handleClearId() {
   prefs.begin("ag", false);
   prefs.remove("id");
@@ -1466,6 +1499,8 @@ void setup() {
     webServer.on("/s8scan", handleS8Scan);
     webServer.on("/setid", handleSetId);
     webServer.on("/clearid", handleClearId);
+    webServer.on("/settoken", handleSetToken);
+    webServer.on("/setwifi", handleSetWifi);
     webServer.on("/macinfo", handleMacInfo);
     webServer.on("/i2cscan", handleI2CScan);
     webServer.on("/setperiod", handleSetPeriod);

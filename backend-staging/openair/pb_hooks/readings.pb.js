@@ -25,7 +25,7 @@ routerAdd("POST", "/api/openair/ingest", (e) => {
     const ALLOWED_BOOL = [
       "pm_10s_ok","pm_60s_ok","pm_15m_ok","sensor_ok","sgpConditioning",
     ];
-    const ALLOWED_TEXT = ["reset_reason"];
+    const ALLOWED_TEXT = ["reset_reason", "ip"];
 
     const shape = { device_serial: "", ts: "", fw_version: "" };
     for (const k of ALLOWED_NUM)  shape[k] = -0.0;  // float64, not int64

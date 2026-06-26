@@ -1,0 +1,18 @@
+# Reproducible build profile for the OpenAir NextPM firmware.
+# Build with:  arduino-cli compile --profile openair sketch
+# Pins the ESP32 core and every library to a known-good version so a build on
+# any machine (or CI) produces the same image.
+profiles:
+  openair:
+    fqbn: esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160,FlashFreq=80,FlashMode=qio
+    platforms:
+      - platform: esp32:esp32 (3.3.7)
+        platform_index_url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+    libraries:
+      - WiFiManager (2.0.17)
+      - Sensirion I2C SGP41 (1.0.0)
+      - Sensirion Gas Index Algorithm (3.2.3)
+      - Sensirion Core (0.7.3)
+      - Sensirion I2C SHT4x (1.1.2)
+
+default_profile: openair

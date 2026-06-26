@@ -22,9 +22,14 @@ REMOTE_DIR="/root/openair/pb_public/firmware"
 FQBN="esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160,FlashFreq=80,FlashMode=qio"
 BIN="build/sketch.ino.bin"
 
+# src/main.cpp is the canonical source; sketch/sketch.ino is a generated mirror
+# (the Arduino build target). Always re-mirror before building so the two can
+# never diverge silently.
+cp src/main.cpp sketch/sketch.ino
+
 if [[ "${1:-}" != "--no-build" ]]; then
-  echo "==> Compiling..."
-  arduino-cli compile --fqbn "$FQBN" --output-dir build sketch
+  echo "==> Compiling (pinned profile)..."
+  arduino-cli compile --profile openair --output-dir build sketch
 fi
 
 [[ -f "$BIN" ]] || { echo "ERROR: $BIN not found (compile first)"; exit 1; }
