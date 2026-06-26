@@ -8,5 +8,8 @@ build/
 
 # Local secrets (never commit the device token / .env)
 .env
+secrets.h
+sketch/secrets.h
+src/secrets.h
 backend-staging/openair/.env
 backend-staging/openair/pb_data/

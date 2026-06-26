@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AirSentinels OpenAir — Stations</title>
+<style>
+  :root{--bg:#0f1115;--card:#1a1d24;--card2:#21252e;--line:#2b303b;--fg:#e8eaed;--mut:#8b93a1;
+        --ok:#4caf50;--warn:#ffa000;--err:#f44336;--accent:#5b9dff;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--fg)}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);
+         position:sticky;top:0;background:var(--bg);z-index:5}
+  header h1{font-size:17px;margin:0;font-weight:600}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--mut);display:inline-block}
+  .dot.live{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .dot.stale{background:var(--warn)}
+  .dot.dead{background:var(--err)}
+  .sub{color:var(--mut);font-size:12px}
+  main{max-width:1100px;margin:0 auto;padding:18px 20px}
+  .devbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+  .devtab{padding:8px 14px;border-radius:8px;background:var(--card);border:1px solid var(--line);
+          cursor:pointer;font-size:13px}
+  .devtab.active{background:#243047;border-color:var(--accent);color:#cfe0ff}
+  .devtab .meta{display:block;color:var(--mut);font-size:11px;margin-top:2px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:18px}
+  .tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .tile .k{color:var(--mut);font-size:12px}
+  .tile .v{font-size:27px;font-weight:600;line-height:1.15;margin-top:2px}
+  .tile .u{color:var(--mut);font-size:11px}
+  .tile.acc{border-color:var(--accent)}
+  .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}
+  @media(max-width:720px){.charts{grid-template-columns:1fr}}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .panel h3{margin:0 0 8px;font-size:13px;font-weight:600;color:var(--mut)}
+  canvas{width:100%;height:160px;display:block}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:right;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--mut);font-weight:500;position:sticky;top:0;background:var(--card)}
+  .tblwrap{max-height:320px;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
+  .empty{color:var(--mut);text-align:center;padding:40px}
+  a{color:var(--accent)}
+  .legend{display:flex;gap:14px;font-size:11px;color:var(--mut);margin-top:6px}
+  .legend span b{display:inline-block;width:10px;height:3px;vertical-align:middle;margin-right:4px}
+</style>
+</head>
+<body>
+<header>
+  <span id="dot" class="dot"></span>
+  <h1>AirSentinels OpenAir</h1>
+  <span class="sub" id="status">connexion…</span>
+  <span class="sub" style="margin-left:auto" id="clock"></span>
+</header>
+<main>
+  <div class="devbar" id="devbar"></div>
+  <div id="content"><div class="empty">Chargement…</div></div>
+</main>
+
+<script>
+const API = location.origin + "/api/collections";
+const PM25_BANDS = [[12,"#4caf50","Bon"],[35,"#ffa000","Moyen"],[55,"#ff7043","Dégradé"],
+                    [150,"#f44336","Mauvais"],[1e9,"#9c27b0","Très mauvais"]];
+function pm25Band(v){ for(const[m,c,l]of PM25_BANDS) if(v<=m) return{c,l}; return{c:"#9c27b0",l:"—"}; }
+function co2Color(v){ return v<800?"#4caf50":v<1200?"#ffa000":v<2000?"#ff7043":"#f44336"; }
+
+let devices=[], selected=null, timer=null;
+
+async function jget(path){
+  const r=await fetch(API+path,{cache:"no-store"});
+  if(!r.ok) throw new Error("HTTP "+r.status);
+  return r.json();
+}
+const fmt=(v,d=1)=> (v==null||v===undefined||Number.isNaN(+v))?"—":(+v).toFixed(d);
+const ageStr=s=> s<90?Math.round(s)+" s": s<5400?Math.round(s/60)+" min":Math.round(s/3600)+" h";
+
+async function loadDevices(){
+  const res=await jget("/devices/records?sort=-last_seen&perPage=50");
+  devices=res.items;
+  if(!devices.length){ document.getElementById("content").innerHTML=
+      '<div class="empty">Aucune station enregistrée pour l’instant.<br>Une station apparaît dès son premier POST.</div>'; return; }
+  if(!selected || !devices.find(d=>d.id===selected)) selected=devices[0].id;
+  renderDevbar();
+  await refresh();
+}
+
+function renderDevbar(){
+  const now=Date.now();
+  document.getElementById("devbar").innerHTML = devices.map(d=>{
+    const age=d.last_seen? (now-new Date(d.last_seen).getTime())/1000 : 1e9;
+    const st=age<90?"live":age<600?"stale":"dead";
+    const col=st==="live"?"var(--ok)":st==="stale"?"var(--warn)":"var(--err)";
+    return `<div class="devtab ${d.id===selected?'active':''}" onclick="pick('${d.id}')">
+      <span style="color:${col}">●</span> ${esc(d.name||d.device_serial)}
+      <span class="meta">${esc(d.device_serial)} · ${d.fw_version?'fw '+esc(d.fw_version):'fw ?'}</span>
+    </div>`;
+  }).join("");
+}
+function pick(id){ selected=id; renderDevbar(); refresh(); }
+function esc(s){ return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function refresh(){
+  if(!selected) return;
+  try{
+    const dev=devices.find(d=>d.id===selected);
+    const res=await jget(`/readings/records?filter=device='${selected}'&sort=-ts&perPage=120`);
+    const rows=res.items;
+    res_count=rows.length;
+    setStatus(dev,rows[0]);
+    renderContent(dev,rows);
+  }catch(e){ document.getElementById("status").textContent="erreur: "+e.message; }
+}
+
+function setStatus(dev,last){
+  const dot=document.getElementById("dot"), st=document.getElementById("status");
+  if(!last){ dot.className="dot"; st.textContent="pas encore de données"; return; }
+  const age=(Date.now()-new Date(last.ts).getTime())/1000;
+  dot.className="dot "+(age<90?"live":age<600?"stale":"dead");
+  st.textContent=`dernier point il y a ${ageStr(age)} · ${res_count} pts`;
+}
+let res_count=0;
+
+function renderContent(dev,rows){
+  res_count=rows.length;
+  if(!rows.length){ document.getElementById("content").innerHTML='<div class="empty">Station enregistrée, en attente de mesures…</div>'; return; }
+  const d=rows[0];
+  const b=pm25Band(+d.pm25||0);
+  const age=(Date.now()-new Date(d.ts).getTime())/1000;
+  const tiles=[
+    ["PM2.5",fmt(d.pm25),"µg/m³",`<span class="pill" style="background:${b.c}22;color:${b.c}">${b.l}</span>`,true],
+    ["PM1",fmt(d.pm1),"µg/m³"],
+    ["PM10",fmt(d.pm10),"µg/m³"],
+    ["PM0.3≈",fmt(d.pm003_dL,0),"/dL"],
+    ["CO₂",`<span style="color:${co2Color(+d.co2||0)}">${fmt(d.co2,0)}</span>`,"ppm"],
+    ["Temp",fmt(d.atmp),"°C"],
+    ["Humidité",fmt(d.rhum,0),"%"],
+    ["TVOC",fmt(d.tvoc_index,0),"index"],
+    ["NOx",fmt(d.nox_index,0),"index"],
+    ["RSSI",fmt(d.rssi,0),"dBm"],
+  ];
+  const tilesHtml=tiles.map(t=>`<div class="tile ${t[4]?'acc':''}">
+    <div class="k">${t[0]}</div><div class="v">${t[1]}</div><div class="u">${t[2]||""} ${t[3]||""}</div></div>`).join("");
+
+  const recent=rows.slice(0,20).map(r=>`<tr>
+    <td>${new Date(r.ts).toLocaleString('fr-FR',{hour12:false})}</td>
+    <td>${fmt(r.pm1)}</td><td>${fmt(r.pm25)}</td><td>${fmt(r.pm10)}</td>
+    <td>${fmt(r.pm003_dL,0)}</td><td>${fmt(r.co2,0)}</td><td>${fmt(r.atmp)}</td>
+    <td>${fmt(r.rhum,0)}</td><td>${fmt(r.rssi,0)}</td></tr>`).join("");
+
+  document.getElementById("content").innerHTML=`
+    <div class="grid">${tilesHtml}</div>
+    <div class="sub" style="margin:-6px 0 14px">Station <b>${esc(dev.device_serial)}</b> · maj ${new Date(d.ts).toLocaleString('fr-FR',{hour12:false})} (il y a ${ageStr(age)}) · fenêtre POST ${d.postAvgSec||"?"}s · fw ${esc(dev.fw_version||"?")}</div>
+    <div class="charts">
+      <div class="panel"><h3>PM (µg/m³) — ${rows.length} derniers points</h3><canvas id="cpm"></canvas>
+        <div class="legend"><span><b style="background:#5b9dff"></b>PM1</span><span><b style="background:#4caf50"></b>PM2.5</span><span><b style="background:#ffa000"></b>PM10</span></div></div>
+      <div class="panel"><h3>CO₂ (ppm)</h3><canvas id="cco2"></canvas></div>
+    </div>
+    <div class="panel" style="margin-bottom:10px"><h3>Mesures récentes</h3></div>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Horodatage</th><th>PM1</th><th>PM2.5</th><th>PM10</th><th>PM0.3/dL</th><th>CO₂</th><th>T°</th><th>RH</th><th>RSSI</th></tr></thead>
+      <tbody>${recent}</tbody></table></div>`;
+
+  const chrono=rows.slice().reverse();
+  drawChart("cpm",chrono,[["pm1","#5b9dff"],["pm25","#4caf50"],["pm10","#ffa000"]]);
+  drawChart("cco2",chrono,[["co2","#ff7043"]]);
+}
+
+function drawChart(id,rows,series){
+  const cv=document.getElementById(id); if(!cv) return;
+  const dpr=window.devicePixelRatio||1, W=cv.clientWidth, H=160;
+  cv.width=W*dpr; cv.height=H*dpr; const g=cv.getContext("2d"); g.scale(dpr,dpr);
+  g.clearRect(0,0,W,H);
+  const pad={l:38,r:8,t:8,b:18};
+  const xs=rows.map(r=>new Date(r.ts).getTime());
+  let vals=[]; series.forEach(([k])=>rows.forEach(r=>{const v=+r[k]; if(!Number.isNaN(v)&&r[k]!=null)vals.push(v);}));
+  if(!vals.length){ g.fillStyle="#8b93a1"; g.font="12px sans-serif"; g.fillText("pas de données",pad.l,H/2); return; }
+  let mn=Math.min(...vals), mx=Math.max(...vals); if(mn===mx){mx=mn+1;} mn=Math.min(mn,0);
+  const x0=Math.min(...xs), x1=Math.max(...xs), xr=(x1-x0)||1;
+  const px=t=>pad.l+( (t-x0)/xr )*(W-pad.l-pad.r);
+  const py=v=>pad.t+(1-(v-mn)/(mx-mn))*(H-pad.t-pad.b);
+  // grid + y labels
+  g.strokeStyle="#2b303b"; g.fillStyle="#8b93a1"; g.font="10px sans-serif"; g.lineWidth=1;
+  for(let i=0;i<=3;i++){ const v=mn+(mx-mn)*i/3, y=py(v);
+    g.beginPath();g.moveTo(pad.l,y);g.lineTo(W-pad.r,y);g.stroke();
+    g.fillText(v.toFixed(v<10?1:0),4,y+3); }
+  series.forEach(([k,col])=>{
+    g.strokeStyle=col; g.lineWidth=1.8; g.beginPath(); let started=false;
+    rows.forEach(r=>{ const v=+r[k]; if(r[k]==null||Number.isNaN(v)){return;}
+      const X=px(new Date(r.ts).getTime()), Y=py(v);
+      if(!started){g.moveTo(X,Y);started=true;}else g.lineTo(X,Y); });
+    g.stroke();
+  });
+}
+
+function tick(){ document.getElementById("clock").textContent=new Date().toLocaleTimeString('fr-FR',{hour12:false}); }
+setInterval(tick,1000); tick();
+
+loadDevices().catch(e=>{document.getElementById("content").innerHTML='<div class="empty">Erreur de connexion au backend: '+e.message+'</div>';});
+timer=setInterval(()=>{ loadDevices().catch(()=>{}); },10000);
+</script>
+</body>
+</html>

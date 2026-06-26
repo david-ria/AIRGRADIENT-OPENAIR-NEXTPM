@@ -32,6 +32,24 @@
 #include <math.h>
 #include <string.h>
 
+// Optional compile-time provisioning (gitignored secrets.h). Lets a station
+// connect + authenticate without the captive portal — handy for plug-and-play
+// deployment. Falls back to the portal when absent or when the hardcoded Wi-Fi
+// is unreachable. NEVER publish an OTA binary built with a real token here:
+// the token would be extractable from the public .bin.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
+#ifndef WIFI_SSID_DEFAULT
+  #define WIFI_SSID_DEFAULT ""
+#endif
+#ifndef WIFI_PASS_DEFAULT
+  #define WIFI_PASS_DEFAULT ""
+#endif
+#ifndef DEVICE_TOKEN_DEFAULT
+  #define DEVICE_TOKEN_DEFAULT ""
+#endif
+
 // Forward decl so the Arduino .ino auto-prototypes see the type name
 struct NextPMSample;
 
@@ -455,6 +473,21 @@ static bool s8ReadCO2(uint16_t& co2ppm, String& txHex, String& rawHex) {
 // ==================== Wi-Fi / Portal ==================
 bool ensureWifiConnected() {
   if (WiFi.status() == WL_CONNECTED) return true;
+
+  // Plug-and-play: try hardcoded creds first (from secrets.h), before the portal.
+  if (strlen(WIFI_SSID_DEFAULT) > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
+    Serial.printf("Wi-Fi: trying hardcoded SSID=%s ...\n", WIFI_SSID_DEFAULT);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("Wi-Fi OK (hardcoded): IP=%s RSSI=%d\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      return true;
+    }
+    Serial.println("Hardcoded Wi-Fi failed — falling back to captive portal");
+  }
 
   WiFi.mode(WIFI_STA);
   WiFiManager wm;
@@ -1276,6 +1309,11 @@ void setup() {
   }
   latest.postAvgSec = loadSavedPostAvgSec();
   gDeviceToken = loadSavedToken();
+  if (gDeviceToken.length() == 0 && strlen(DEVICE_TOKEN_DEFAULT) > 0) {
+    gDeviceToken = DEVICE_TOKEN_DEFAULT;
+    saveToken(gDeviceToken);
+    Serial.println("[TOKEN] using compile-time default");
+  }
   otaInitBootState();
   Serial.printf("DeviceID (%s) serial=%s postAvgSec=%u s token=%s\n",
                 gSensorIdFull.c_str(), deviceSerial12().c_str(), latest.postAvgSec,
