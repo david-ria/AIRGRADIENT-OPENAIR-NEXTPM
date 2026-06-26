@@ -142,6 +142,7 @@ static String   gOutbox[OUTBOX_MAX];
 static int      gObHead = 0, gObCount = 0;
 static uint32_t gBackoffUntilMs = 0, gBackoffMs = 0;
 static uint32_t gPostOk = 0, gPostFail = 0;   // lifetime counters (telemetry)
+static uint32_t gCycleJitterMs = 0;           // ±jitter so co-located stations don't POST in lockstep
 
 // I2C pins (AirGradient OpenAir C3 board)
 constexpr int I2C_SDA = 7;
@@ -1554,8 +1555,9 @@ void loop() {
     otaCheckAndApply();
   }
 
-  if (millis() - tLastPost > POST_PERIOD_MS) {
+  if (millis() - tLastPost > POST_PERIOD_MS + gCycleJitterMs) {
     tLastPost = millis();
+    gCycleJitterMs = esp_random() % 5000;  // 0–5 s, re-rolled each cycle: desyncs a shared hotspot
 
     // Query all 3 averaging periods (10 s, 60 s, 15 min). Small gap between requests.
     nextpmReadMassCmd(0x11, latest.avg10s); delay(80);
