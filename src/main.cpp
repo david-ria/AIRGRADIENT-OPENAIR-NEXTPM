@@ -19,6 +19,8 @@
 #include <WiFiManager.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 #include <time.h>
 #include <HardwareSerial.h>
 #include <Preferences.h>
@@ -124,6 +126,22 @@ constexpr uint32_t OTA_FIRST_CHECK_MS     = 45UL * 1000UL;          // first che
 constexpr uint32_t OTA_CONFIRM_TIMEOUT_MS = 5UL * 60UL * 1000UL;    // a fresh image must POST OK within 5 min
 static bool     gOtaPendingConfirm = false;  // booted a freshly OTA'd image, not yet confirmed
 static uint32_t gBootMs = 0;
+
+// -------------------- Reliability (Phase 2a) ---------
+constexpr uint32_t WDT_TIMEOUT_S      = 120;        // reboot if loop or gas task hangs this long
+constexpr uint32_t WIFI_CHECK_MS      = 5000;       // reconnect cadence when disconnected
+constexpr uint32_t NTP_RESYNC_OK_MS   = 6UL * 3600UL * 1000UL;  // resync every 6 h once synced
+constexpr uint32_t NTP_RETRY_MS       = 5UL * 60UL * 1000UL;    // retry every 5 min until synced
+constexpr int      OUTBOX_MAX         = 60;         // ~30 min of 30 s readings buffered offline
+constexpr uint32_t BACKOFF_MIN_MS     = 30000;      // first backoff after a server error
+constexpr uint32_t BACKOFF_MAX_MS     = 300000;     // cap at 5 min
+constexpr int      DRAIN_PER_CYCLE    = 15;         // max buffered POSTs flushed per cycle
+
+// Offline outbox (FIFO ring of pre-serialized JSON payloads).
+static String   gOutbox[OUTBOX_MAX];
+static int      gObHead = 0, gObCount = 0;
+static uint32_t gBackoffUntilMs = 0, gBackoffMs = 0;
+static uint32_t gPostOk = 0, gPostFail = 0;   // lifetime counters (telemetry)
 
 // I2C pins (AirGradient OpenAir C3 board)
 constexpr int I2C_SDA = 7;
@@ -299,6 +317,22 @@ void saveToken(const String& t) {
   prefs.begin("ag", false);
   prefs.putString("tok", t);
   prefs.end();
+}
+
+// Short label for the last reset cause — distinguishes a clean OTA reboot from a
+// watchdog/panic/brownout in the fleet telemetry.
+const char* resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "poweron";
+    case ESP_RST_SW:       return "sw";       // ESP.restart() (OTA, rollback)
+    case ESP_RST_PANIC:    return "panic";
+    case ESP_RST_INT_WDT:  return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt"; // our watchdog fired
+    case ESP_RST_WDT:      return "wdt";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_DEEPSLEEP:return "deepsleep";
+    default:               return "other";
+  }
 }
 
 // ISO8601 UTC timestamp, e.g. 2026-06-25T07:35:00Z. Returns "" if NTP not synced.
@@ -543,22 +577,31 @@ bool ensureWifiConnected() {
   return ok;
 }
 
-// ==================== POST -> AirSentinels ===========
-// Builds the native AirSentinels payload from `latest` and POSTs it over TLS to
-// our PocketBase ingest hook. device_serial + X-Device-Token identify the unit;
-// ts is sent only when NTP is synced (else the server stamps ingestion time).
-static bool postToAirSentinels() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[POST] No Wi-Fi.");
-    return false;
-  }
-  if (gDeviceToken.length() < 8) {
-    Serial.println("[POST] No device token — set it via the captive portal.");
-    latest.lastPostCode = -1;
-    latest.lastPostResp = "no token";
-    return false;
-  }
+// ==================== Outbox (offline buffer) ========
+static void otaConfirmSuccess();  // defined in the OTA section below
+static bool outboxEmpty() { return gObCount == 0; }
+static void outboxPush(const String& s) {
+  int idx = (gObHead + gObCount) % OUTBOX_MAX;
+  if (gObCount < OUTBOX_MAX) { gOutbox[idx] = s; gObCount++; }
+  else { gOutbox[gObHead] = s; gObHead = (gObHead + 1) % OUTBOX_MAX; }  // overwrite oldest
+}
+static String& outboxPeek() { return gOutbox[gObHead]; }
+static void outboxPop() {
+  if (gObCount > 0) { gOutbox[gObHead] = String(); gObHead = (gObHead + 1) % OUTBOX_MAX; gObCount--; }
+}
+static void resetBackoff() { gBackoffMs = 0; gBackoffUntilMs = 0; }
+static void applyBackoff() {
+  gBackoffMs = gBackoffMs ? min(gBackoffMs * 2, BACKOFF_MAX_MS) : BACKOFF_MIN_MS;
+  gBackoffUntilMs = millis() + gBackoffMs;
+  Serial.printf("[POST] backoff %u s (outbox=%d)\n", gBackoffMs / 1000, gObCount);
+}
 
+// ==================== POST -> AirSentinels ===========
+// Builds the native AirSentinels payload from `latest`. device_serial +
+// X-Device-Token identify the unit; ts is sent only when NTP is synced (else the
+// server stamps ingestion time). Trailing health telemetry lets the fleet see
+// uptime / heap / buffer depth / reset cause without a serial console.
+static String buildPayload() {
   String payload = String("{\"device_serial\":\"") + deviceSerial12() + "\"";
   String ts = isoUtcNow();
   if (ts.length()) payload += String(",\"ts\":\"") + ts + "\"";
@@ -618,27 +661,72 @@ static bool postToAirSentinels() {
   }
   payload += String(",\"sensor_ok\":") + ((latest.massOk && latest.co2Ok) ? "true" : "false");
   payload += String(",\"sgpConditioning\":") + (latest.sgpConditioning ? "true" : "false");
-  payload += "}";
 
+  // Health telemetry
+  payload += String(",\"uptime_s\":") + (millis() / 1000);
+  payload += String(",\"heap_free\":") + (uint32_t)ESP.getFreeHeap();
+  payload += String(",\"outbox_depth\":") + gObCount;
+  payload += String(",\"post_fail\":") + gPostFail;
+  payload += String(",\"reset_reason\":\"") + resetReasonStr() + "\"";
+  payload += "}";
+  return payload;
+}
+
+// Single HTTPS POST of one payload. Returns the HTTP status (or a negative
+// transport error). Explicit timeouts so a half-open TLS connection can't wedge
+// the loop (the watchdog is the last resort).
+static int sendPayload(const String& payload) {
   WiFiClientSecure client;
   client.setCACert(ISRG_ROOT_X1_PEM);
   HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
   if (!http.begin(client, AIRSENTINELS_URL)) {
-    Serial.println("[POST] http.begin failed");
-    latest.lastPostCode = -2;
-    latest.lastPostResp = "begin fail";
-    return false;
+    latest.lastPostCode = -2; latest.lastPostResp = "begin fail";
+    return -2;
   }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Token", gDeviceToken);
   int code = http.POST(payload);
   String resp = http.getString();
   http.end();
-
   latest.lastPostCode = code;
   latest.lastPostResp = resp;
-  Serial.printf("[POST] %d %s\n", code, resp.c_str());
-  return (code >= 200 && code < 300);
+  return code;
+}
+
+// One POST cycle: queue the fresh reading, then drain the outbox FIFO. A server
+// error (or transport failure) stops the drain and arms exponential backoff, so
+// data survives a flaky 4G link instead of being dropped.
+static void doPostCycle() {
+  if (gDeviceToken.length() < 8) {
+    Serial.println("[POST] No device token — set it via the captive portal.");
+    latest.lastPostCode = -1; latest.lastPostResp = "no token";
+    return;
+  }
+  outboxPush(buildPayload());                 // strict FIFO: this reading goes last
+  if (WiFi.status() != WL_CONNECTED) return;  // keep buffering until WiFi returns
+  if (millis() < gBackoffUntilMs) return;     // in backoff window: buffer only
+
+  int drained = 0;
+  bool anyOk = false;
+  while (!outboxEmpty() && drained < DRAIN_PER_CYCLE) {
+    esp_task_wdt_reset();
+    int code = sendPayload(outboxPeek());
+    if (code >= 200 && code < 300) {
+      outboxPop(); drained++; anyOk = true; gPostOk++;
+    } else {
+      gPostFail++;
+      Serial.printf("[POST] %d (outbox=%d) — stop drain\n", code, gObCount);
+      applyBackoff();
+      break;
+    }
+  }
+  if (anyOk) {
+    Serial.printf("[POST] flushed %d, outbox=%d\n", drained, gObCount);
+    if (outboxEmpty()) resetBackoff();        // fully caught up
+    otaConfirmSuccess();                       // a real POST proves a fresh image works
+  }
 }
 
 // ==================== Web Handlers ====================
@@ -998,9 +1086,11 @@ static bool sampleSGP() {
 // stretch the gas-index algorithm cadence (which is what makes TVOC/NOx
 // look like a sawtooth).
 static void gasSensorTask(void*) {
+  esp_task_wdt_add(NULL);   // a wedged I2C read here also triggers a recovery reboot
   TickType_t lastWake = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(GAS_SAMPLE_MS);
   for (;;) {
+    esp_task_wdt_reset();
     if (i2cInitialized) {
       i2cLock();
       sampleSHT();
@@ -1249,6 +1339,8 @@ static void otaCheckAndApply() {
   WiFiClientSecure client;
   client.setCACert(ISRG_ROOT_X1_PEM);
   HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
   if (!http.begin(client, OTA_MANIFEST_URL)) return;
   int code = http.GET();
   if (code != 200) { Serial.printf("[OTA] manifest HTTP %d\n", code); http.end(); return; }
@@ -1266,6 +1358,8 @@ static void otaCheckAndApply() {
   WiFiClientSecure dlc;
   dlc.setCACert(ISRG_ROOT_X1_PEM);
   HTTPClient dl;
+  dl.setConnectTimeout(8000);
+  dl.setTimeout(20000);   // larger read window for the ~1.3 MB image
   if (!dl.begin(dlc, url)) { Serial.println("[OTA] dl begin fail"); return; }
   int dcode = dl.GET();
   if (dcode != 200) { Serial.printf("[OTA] bin HTTP %d\n", dcode); dl.end(); return; }
@@ -1278,9 +1372,11 @@ static void otaCheckAndApply() {
   }
   if (md5.length() == 32) Update.setMD5(md5.c_str());  // verified during write
 
+  esp_task_wdt_reset();  // the stream write can take ~10-20 s
   WiFiClient* stream = dl.getStreamPtr();
   size_t written = Update.writeStream(*stream);
   dl.end();
+  esp_task_wdt_reset();
   Serial.printf("[OTA] wrote %u bytes\n", (unsigned)written);
 
   if (!Update.end(true)) {
@@ -1298,9 +1394,19 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   gBootMs = millis();
-  Serial.printf("\nBoot — firmware %s\n", FW_VERSION);
+  Serial.printf("\nBoot — firmware %s (reset=%s)\n", FW_VERSION, resetReasonStr());
+
+  // Task watchdog: reboot if the loop or gas task stops feeding it (I2C lockup,
+  // UART stall, wedged TLS handshake). The Arduino core may already have TWDT
+  // running — reconfigure rather than fail.
+  esp_task_wdt_config_t wdtCfg = { .timeout_ms = WDT_TIMEOUT_S * 1000,
+                                   .idle_core_mask = 0, .trigger_panic = true };
+  if (esp_task_wdt_init(&wdtCfg) == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdtCfg);
+  esp_task_wdt_add(NULL);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
 
   gSensorIdFull = loadSavedSensorId();
   if (gSensorIdFull.length() == 0) {
@@ -1369,17 +1475,40 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t tLastPost = 0, tTick = 0, tLastGas = 0, tLastOta = 0;
+  static uint32_t tLastPost = 0, tTick = 0, tLastGas = 0, tLastOta = 0,
+                  tWifiChk = 0, tNtp = 0;
+  esp_task_wdt_reset();
   webServer.handleClient();
 
   if (millis() - tTick > 2000) {
     tTick = millis();
-    Serial.printf("[tick] ip=%s rssi=%d\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    Serial.printf("[tick] ip=%s rssi=%d heap=%u outbox=%d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI(),
+                  (unsigned)ESP.getFreeHeap(), gObCount);
   }
 
   // Gas sampling lives in its own FreeRTOS task (see gasSensorTask).
   (void)tLastGas;
+
+  // WiFi keep-alive: non-blocking reconnect attempts when the link drops (4G
+  // hotspot reboot, range). Never re-opens the blocking captive portal here.
+  if (millis() - tWifiChk > WIFI_CHECK_MS) {
+    tWifiChk = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WiFi] down — reconnecting");
+      if (strlen(WIFI_SSID_DEFAULT) > 0) WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
+      else WiFi.reconnect();
+    }
+  }
+
+  // NTP: resync periodically (clock drift over weeks); retry faster until synced.
+  uint32_t ntpDue = gTimeSynced ? NTP_RESYNC_OK_MS : NTP_RETRY_MS;
+  if (WiFi.status() == WL_CONNECTED && millis() - tNtp > ntpDue) {
+    tNtp = millis();
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    struct tm tmv;
+    if (getLocalTime(&tmv, 3000)) gTimeSynced = true;
+  }
 
   // OTA: first check shortly after boot, then on a slow cadence. Roll back a
   // fresh image that never managed a successful POST.
@@ -1451,7 +1580,7 @@ void loop() {
     latest.lastUpdateMs = millis();
 
     if (okMass || okBins || okCO2) {
-      if (postToAirSentinels()) otaConfirmSuccess();
+      doPostCycle();   // buffers + drains the outbox; confirms OTA on success
     }
   }
 }

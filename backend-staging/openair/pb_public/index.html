@@ -148,9 +148,20 @@ function renderContent(dev,rows){
     <td>${fmt(r.pm003_dL,0)}</td><td>${fmt(r.co2,0)}</td><td>${fmt(r.atmp)}</td>
     <td>${fmt(r.rhum,0)}</td><td>${fmt(r.rssi,0)}</td></tr>`).join("");
 
+  const heapKB = d.heap_free!=null ? Math.round(d.heap_free/1024)+" KB" : "—";
+  const upStr = d.uptime_s!=null ? ageStr(+d.uptime_s) : "—";
+  const obx = +d.outbox_depth||0;
+  const health = `<div class="sub" style="margin:-2px 0 14px;display:flex;gap:16px;flex-wrap:wrap">
+    <span>⏱ uptime <b>${upStr}</b></span>
+    <span>🧠 heap <b>${heapKB}</b></span>
+    <span>📦 buffer <b style="color:${obx>0?'var(--warn)':'var(--mut)'}">${obx}</b></span>
+    <span>✖ POST fail <b style="color:${(+d.post_fail||0)>0?'var(--warn)':'var(--mut)'}">${d.post_fail||0}</b></span>
+    <span>↻ reset <b>${esc(d.reset_reason||'?')}</b></span>
+  </div>`;
   document.getElementById("content").innerHTML=`
     <div class="grid">${tilesHtml}</div>
-    <div class="sub" style="margin:-6px 0 14px">Station <b>${esc(dev.device_serial)}</b> · maj ${new Date(d.ts).toLocaleString('fr-FR',{hour12:false})} (il y a ${ageStr(age)}) · fenêtre POST ${d.postAvgSec||"?"}s · fw ${esc(dev.fw_version||"?")}</div>
+    <div class="sub" style="margin:-6px 0 6px">Station <b>${esc(dev.device_serial)}</b> · maj ${new Date(d.ts).toLocaleString('fr-FR',{hour12:false})} (il y a ${ageStr(age)}) · fenêtre POST ${d.postAvgSec||"?"}s · fw ${esc(dev.fw_version||"?")}</div>
+    ${health}
     <div class="charts">
       <div class="panel"><h3>PM (µg/m³) — ${rows.length} derniers points</h3><canvas id="cpm"></canvas>
         <div class="legend"><span><b style="background:#5b9dff"></b>PM1</span><span><b style="background:#4caf50"></b>PM2.5</span><span><b style="background:#ffa000"></b>PM10</span></div></div>

@@ -20,14 +20,17 @@ routerAdd("POST", "/api/openair/ingest", (e) => {
       "pm_15m_pm1","pm_15m_pm25","pm_15m_pm10","pm_15m_cntPM1_dL","pm_15m_cntPM25_dL","pm_15m_cntPM10_dL",
       "co2","tvoc_index","nox_index","tvoc_index_avg","nox_index_avg","tvoc_raw","nox_raw",
       "atmp","rhum","rssi","data_age_sec","postAvgSec",
+      "uptime_s","heap_free","outbox_depth","post_fail",
     ];
     const ALLOWED_BOOL = [
       "pm_10s_ok","pm_60s_ok","pm_15m_ok","sensor_ok","sgpConditioning",
     ];
+    const ALLOWED_TEXT = ["reset_reason"];
 
     const shape = { device_serial: "", ts: "", fw_version: "" };
     for (const k of ALLOWED_NUM)  shape[k] = -0.0;  // float64, not int64
     for (const k of ALLOWED_BOOL) shape[k] = false;
+    for (const k of ALLOWED_TEXT) shape[k] = "";
 
     const data = new DynamicModel(shape);
     e.bindBody(data);
@@ -68,6 +71,7 @@ routerAdd("POST", "/api/openair/ingest", (e) => {
     reading.set("ts", ts);
     for (const k of ALLOWED_NUM)  reading.set(k, data[k]);
     for (const k of ALLOWED_BOOL) reading.set(k, data[k]);
+    for (const k of ALLOWED_TEXT) if (data[k]) reading.set(k, data[k]);
     $app.save(reading);
 
     device.set("last_seen", ts);
