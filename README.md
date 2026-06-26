@@ -131,6 +131,9 @@ Once connected to Wi-Fi the device serves:
 | `http://<device-ip>/macinfo` | Stored Sensor ID, STA MAC, AP MAC — useful when the ID drifts from the MAC |
 | `http://<device-ip>/setid?id=<12hex>` | Overwrite the stored Sensor ID (saved to NVS) |
 | `http://<device-ip>/clearid` | Reset Sensor ID back to STA-MAC-derived |
+| `http://<device-ip>/settoken?token=<t>` | Set/rotate the AirSentinels device token (saved to NVS) |
+| `http://<device-ip>/setwifi?ssid=<s>&pass=<p>` | Switch the station to another Wi-Fi (saved to NVS) |
+| `http://<device-ip>/nextpmcmd?cmd=<hex>` | Send one NextPM simple-protocol read command (`11/12/13` mass, `25/26/27` bins, `16` T/RH) and dump the raw response — handy to check which channels a sensor firmware supports |
 | `http://<device-ip>/probe` | NextPM Modbus register dump (`regs 0..229`) |
 | `http://<device-ip>/i2cscan` | I²C bus scan across candidate SDA/SCL pin pairs |
 | `http://<device-ip>/s8scan` | S8 UART RX-pin sweep for wiring debug |

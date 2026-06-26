@@ -414,6 +414,41 @@ static bool nextpmReadMassCmd(uint8_t cmd, NextPMSample& s) {
   return true;
 }
 
+// NextPM granulometry via the SIMPLE protocol (cmd 0x25/0x26/0x27 = 10s/60s/15min).
+// These are the real size bins — the Modbus registers (128..137) are empty on this
+// firmware revision. Response is 24 bytes:
+//   [0]=0x81 [1]=cmd [2]=state  then 5 × 4-byte counts (Nb/L), each MSW(2B)+LSW(2B),
+//   big-endian within each 16-bit word, [23]=checksum.
+// Bins: 0.3-0.5, 0.5-1, 1-2.5, 2.5-5, 5-10 µm.
+static bool nextpmReadBinsCmd(uint8_t cmd, float& b03_05, float& b05_1, float& b1_25,
+                              float& b25_5, float& b5_10, String& rawHex) {
+  while (NextPMSerial.available()) NextPMSerial.read();
+  if (!nextpmSendSimpleCmd(cmd)) { rawHex = "(send fail)"; return false; }
+
+  const uint32_t t0 = millis();
+  const uint32_t timeoutMs = 500;
+  uint8_t buf[24]; size_t got = 0;
+  while (got < sizeof(buf) && millis() - t0 < timeoutMs) {
+    if (NextPMSerial.available()) buf[got++] = (uint8_t)NextPMSerial.read();
+  }
+  rawHex = bytesToHex(buf, got);
+  if (got != sizeof(buf)) return false;
+  if (buf[0] != 0x81 || buf[1] != cmd) return false;
+  if (nextpmChecksum(buf, 23) != buf[23]) return false;
+
+  auto U32 = [](const uint8_t* p) -> uint32_t {
+    uint32_t msw = ((uint32_t)p[0] << 8) | p[1];
+    uint32_t lsw = ((uint32_t)p[2] << 8) | p[3];
+    return (msw << 16) | lsw;
+  };
+  b03_05 = (float)U32(&buf[3]);
+  b05_1  = (float)U32(&buf[7]);
+  b1_25  = (float)U32(&buf[11]);
+  b25_5  = (float)U32(&buf[15]);
+  b5_10  = (float)U32(&buf[19]);
+  return true;
+}
+
 // ==================== NextPM: Modbus ==================
 // Returns the number of valid words read (>0) or 0 on failure. Always fills rawHex.
 static size_t nextpmReadHolding(uint16_t regStart, uint16_t qty, uint16_t* outWords, String& rawHex) {
@@ -1272,6 +1307,35 @@ static void handleClearId() {
     "Sensor ID reset to MAC-derived: " + gSensorIdFull + "\n");
 }
 
+// Diagnostic: send one simple-protocol command and dump the raw response, to
+// check which channels a given NextPM unit/firmware actually supports.
+// Read-only allowlist so we never hit a config/sleep/write command by mistake.
+//   /nextpmcmd?cmd=26   -> sends {0x81,0x26,chk}, dumps up to 32 bytes
+static void handleNextpmCmd() {
+  if (!webServer.hasArg("cmd")) {
+    webServer.send(400, "text/plain",
+      "missing ?cmd=<hex>. Allowed (read-only): 11 12 13 (mass) 25 26 27 (bins) 16 (T/RH)\n");
+    return;
+  }
+  long cmd = strtol(webServer.arg("cmd").c_str(), nullptr, 16);
+  const long allowed[] = { 0x11, 0x12, 0x13, 0x25, 0x26, 0x27, 0x16 };
+  bool ok = false;
+  for (long a : allowed) if (a == cmd) ok = true;
+  if (!ok) { webServer.send(400, "text/plain", "cmd not in read-only allowlist\n"); return; }
+
+  while (NextPMSerial.available()) NextPMSerial.read();
+  bool sent = nextpmSendSimpleCmd((uint8_t)cmd);
+  const uint32_t t0 = millis();
+  uint8_t buf[32]; size_t got = 0;
+  while (got < sizeof(buf) && millis() - t0 < 700) {
+    if (NextPMSerial.available()) buf[got++] = (uint8_t)NextPMSerial.read();
+  }
+  String out = "cmd=0x" + String((uint32_t)cmd, HEX) + " sent=" + (sent ? "ok" : "FAIL") +
+               " got=" + String((unsigned)got) + " bytes\n" + bytesToHex(buf, got) + "\n";
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "text/plain", out);
+}
+
 static void handleMacInfo() {
   String staMacLower = agSerial12();
   String apMac = WiFi.softAPmacAddress(); apMac.toLowerCase(); apMac.replace(":", "");
@@ -1502,6 +1566,7 @@ void setup() {
     webServer.on("/clearid", handleClearId);
     webServer.on("/settoken", handleSetToken);
     webServer.on("/setwifi", handleSetWifi);
+    webServer.on("/nextpmcmd", handleNextpmCmd);
     webServer.on("/macinfo", handleMacInfo);
     webServer.on("/i2cscan", handleI2CScan);
     webServer.on("/setperiod", handleSetPeriod);
@@ -1591,10 +1656,13 @@ void loop() {
       Serial.printf("NextPM mass FAIL (sel %us) raw=[%s]\n", latest.postAvgSec, latest.nextpmMassRaw.c_str());
     }
 
-    // Optional: still try the Modbus bins so we can see raw response.
+    // Granulometry bins via the simple protocol (0x25/0x26/0x27), matching the
+    // selected averaging window. Fields c02_05.. carry the 0.3-0.5 .. 5-10 µm bins.
     float c02_05 = 0, c05_10 = 0, c10_25 = 0, c25_50 = 0, c50_100 = 0;
     String rawBins;
-    bool okBins = nextpmReadBinnedCounts(c02_05, c05_10, c10_25, c25_50, c50_100, rawBins);
+    uint8_t binCmd = (latest.postAvgSec == 10) ? 0x25 : (latest.postAvgSec == 900) ? 0x27 : 0x26;
+    delay(80);
+    bool okBins = nextpmReadBinsCmd(binCmd, c02_05, c05_10, c10_25, c25_50, c50_100, rawBins);
     latest.nextpmBinsRaw = rawBins;
     latest.binsOk = okBins;
     if (okBins) {
